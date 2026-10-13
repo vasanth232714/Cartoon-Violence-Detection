@@ -1,0 +1,52 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python caches & build
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment variables & local configs
+.env
+.env.*
+
+# Model checkpoints & weights
+checkpoints/*
+!checkpoints/.gitkeep
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+*.npz
+
+# Video & Audio media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.part
+
+# Runtime data & sqlite databases
+data/uploads/*
+data/evidence/*
+data/database/*
+!data/*/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+
+# Training & labels
+training_cache/
+labelled/

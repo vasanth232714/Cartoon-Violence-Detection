@@ -1,0 +1,6 @@
+{"videos": [
+  {"file": "ep01.mp4", "events": [{"start": 31.0, "end": 39.0}]},
+  {"file": "ep02_calm.mp4", "events": []},
+  {"file": "clip_fight.mp4", "label": "violent"},
+  {"file": "clip_chat.mp4", "label": "non_violent"}
+]}
