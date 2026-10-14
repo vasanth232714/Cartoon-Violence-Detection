@@ -46,9 +46,9 @@ MODEL_REGISTRY = {
         "input_size": 224,
         "mean": (0.45, 0.45, 0.45),
         "std": (0.225, 0.225, 0.225),
-        # Conservative default for an out-of-domain RWF-2000 checkpoint on cartoons.
-        # Users can choose a lower threshold when recall matters more than precision.
-        "default_threshold": 0.75,
+        # Restore the earlier automatic operating point. This out-of-domain
+        # real-world checkpoint is not calibrated for cartoons at any threshold.
+        "default_threshold": 0.55,
         "violent_index": 1,  # probs[0][1] = violent per model card
         "training_domain": "RWF-2000: real-world fighting videos from YouTube (NOT cartoons)",
         "reported_val_f1": "0.93 on RWF-2000 validation (real-world footage; not cartoon)",
@@ -88,8 +88,6 @@ class AnalysisConfig:
     enable_multilingual_toxicity: bool = True
     enable_audio_event_detection: bool = True
     use_temporal_transformer: bool = True
-    enable_videomae_comparison: bool = False
-    videomae_threshold: float = 0.50
     audio_event_threshold: float = 0.35
     verbal_toxicity_threshold: float = 0.85
 
@@ -142,8 +140,6 @@ class AnalysisConfig:
             raise ValueError("audio_event_threshold must be in (0, 1)")
         if not 0.0 < self.verbal_toxicity_threshold < 1.0:
             raise ValueError("verbal_toxicity_threshold must be in (0, 1)")
-        if not 0.0 < self.videomae_threshold < 1.0:
-            raise ValueError("videomae_threshold must be in (0, 1)")
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), sort_keys=True)

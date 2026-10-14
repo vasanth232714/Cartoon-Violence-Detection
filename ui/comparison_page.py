@@ -22,7 +22,7 @@ from pipeline.comparison_pipeline import (BENCHMARK_REPORTS, ComparisonResult,
                                           run_comparison)
 from preprocessing.timestamp_utils import format_timestamp
 from preprocessing.video_loader import VideoMetadata
-from ui.common import jload, render_hero_metric
+from ui.common import jload, render_hero_metric, render_page_header
 
 
 def _render_model_cards() -> None:
@@ -408,18 +408,11 @@ def _render_recommendation(result: ComparisonResult) -> None:
 
 def render(repo: Repository) -> None:
     """Entry point for the Model Comparison page."""
-    st.markdown(
-        """
-        <div style="margin-bottom:1.5rem;">
-            <h2 style="margin:0; font-size:1.75rem; font-weight:700; color:#F8FAFC; letter-spacing:-0.02em;">
-                🔬 Multi-Model Analysis & Comparison
-            </h2>
-            <p style="margin:4px 0 0 0; color:#94A3B8; font-size:0.9rem;">
-                Comparative evaluation across Baseline 3D-CNN, Temporal Transformer Self-Attention, and Multimodal Audio-Visual Fusion.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True
+    render_page_header(
+        title="Multi-Model Analysis & Comparison",
+        subtitle="Comparative evaluation across Baseline 3D-CNN, Temporal Transformer Self-Attention, and Multimodal Audio-Visual Fusion.",
+        badge_text="Multi-Model Engine",
+        badge_color="#8B5CF6"
     )
 
     # Top Section: Model Architecture Cards

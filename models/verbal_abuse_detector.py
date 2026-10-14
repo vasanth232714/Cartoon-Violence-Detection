@@ -68,6 +68,8 @@ CAT_HATE = "Hate Speech & Slurs"
 CAT_TOXICITY = "Toxic language candidate"
 TOXICITY_MODEL_ID = "unitary/multilingual-toxic-xlm-roberta"
 TOXICITY_MODEL_LANGUAGES = {"en", "fr", "es", "it", "pt", "tr", "ru"}
+TAMIL_ABUSE_MODEL_ID = "Hate-speech-CNERG/tamil-codemixed-abusive-MuRIL"
+TAMIL_ABUSE_MODEL_LANGUAGES = {"ta", "tam", "tamil"}
 
 # Explicit threat patterns & keywords
 THREAT_KEYWORDS = [
@@ -193,6 +195,9 @@ class TranscriptSegment:
     confidence: float | None = None
     source: str = "faster_whisper"
     words: list[dict[str, Any]] = field(default_factory=list)
+    toxicity_score: float | None = None
+    toxicity_model: str | None = None
+    toxicity_status: str = "not_scored"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -211,64 +216,140 @@ class VerbalAbuseDetector:
         self.toxicity_threshold = float(toxicity_threshold)
         self.whisper_model_size = whisper_model_size
         self._toxicity_model = None
+        self._toxicity_model_key: str | None = None
         self._toxicity_attempted = False
         self._toxicity_error: str | None = None
+        self._toxicity_model_errors: dict[str, str] = {}
+        self._toxicity_models_used: set[str] = set()
+        self._last_toxicity_model_id: str | None = None
+        self._last_toxicity_status = "not_scored"
         _init_profanity_lexicon()
 
     def _score_multilingual_toxicity(self, text: str, language: str | None) -> float | None:
-        """Load the seven-language Detoxify classifier lazily; output is toxicity only."""
+        """Score supported languages using their matching pretrained classifier."""
         lang = (language or "").split("-")[0].lower()
-        if not self.use_multilingual_classifier or lang not in TOXICITY_MODEL_LANGUAGES:
+        self._last_toxicity_model_id = None
+        if not self.use_multilingual_classifier:
+            self._last_toxicity_status = "disabled"
             return None
+        if lang in TAMIL_ABUSE_MODEL_LANGUAGES:
+            model_key = TAMIL_ABUSE_MODEL_ID
+        elif lang in TOXICITY_MODEL_LANGUAGES:
+            model_key = TOXICITY_MODEL_ID
+        else:
+            self._last_toxicity_status = "unsupported_language"
+            return None
+
+        # Keep only one text classifier resident at a time. Some apps process
+        # mixed-language audio, and both checkpoints are large enough to matter.
+        if self._toxicity_model_key != model_key:
+            self._toxicity_model = None
+            gc.collect()
+            self._toxicity_model_key = model_key
+            self._toxicity_attempted = False
+            self._toxicity_error = None
         try:
             if self._toxicity_model is None:
                 if self._toxicity_attempted:
+                    self._last_toxicity_status = "unavailable" if self._toxicity_error else "not_scored"
                     return None
                 self._toxicity_attempted = True
-                try:
-                    from detoxify import Detoxify
-                    stop_heartbeat, heartbeat_thread = _start_speech_heartbeat("Multilingual toxicity model loading")
-                    try:
-                        self._toxicity_model = Detoxify("multilingual", device="cpu")
-                    finally:
-                        stop_heartbeat.set()
-                        heartbeat_thread.join(timeout=1.0)
-                except ImportError:
-                    logger.info("detoxify package not found; loading %s via transformers", TOXICITY_MODEL_ID)
+                if model_key == TAMIL_ABUSE_MODEL_ID:
                     from transformers import AutoModelForSequenceClassification, AutoTokenizer
                     import torch
-                    stop_heartbeat, heartbeat_thread = _start_speech_heartbeat("Transformers toxicity model loading")
+
+                    stop_heartbeat, heartbeat_thread = _start_speech_heartbeat("Tamil abuse model loading")
                     try:
-                        tok = AutoTokenizer.from_pretrained(TOXICITY_MODEL_ID)
-                        mdl = AutoModelForSequenceClassification.from_pretrained(TOXICITY_MODEL_ID)
-                        mdl.eval()
-                        class _HFToxicity:
-                            def __init__(self, m, t):
-                                self.m = m
-                                self.t = t
-                            def predict(self, txt: str):
-                                inputs = self.t(txt, return_tensors="pt", truncation=True, max_length=512)
+                        tokenizer = AutoTokenizer.from_pretrained(TAMIL_ABUSE_MODEL_ID)
+                        model = AutoModelForSequenceClassification.from_pretrained(TAMIL_ABUSE_MODEL_ID)
+                        model.eval()
+                        labels = {int(index): str(label) for index, label in
+                                  (getattr(model.config, "id2label", {}) or {}).items()}
+                        abuse_index = next((index for index, label in labels.items()
+                                            if any(term in label.casefold() for term in
+                                                   ("abusive", "offensive", "toxic", "profanity"))), None)
+                        if abuse_index is None:
+                            generic_labels = all(label.casefold() in (f"label_{index}".casefold(), str(index))
+                                                 for index, label in labels.items())
+                            # The model card documents LABEL_0=Normal and LABEL_1=Abusive.
+                            if model.config.num_labels == 2 and generic_labels:
+                                abuse_index = 1
+                            else:
+                                raise ValueError(f"Cannot verify abusive label mapping for {TAMIL_ABUSE_MODEL_ID}: {labels}")
+                        if model.config.num_labels != 2 or abuse_index not in labels:
+                            raise ValueError(f"Unexpected Tamil abuse model labels: {labels}")
+
+                        class _TamilAbuse:
+                            def __init__(self, mdl, tok, positive_index):
+                                self.model = mdl
+                                self.tokenizer = tok
+                                self.positive_index = positive_index
+
+                            def predict(self, text: str):
+                                inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
                                 with torch.inference_mode():
-                                    logits = self.m(**inputs).logits
-                                    probs = torch.sigmoid(logits)[0].tolist()
-                                return {"toxicity": probs[0] if probs else 0.0}
-                        self._toxicity_model = _HFToxicity(mdl, tok)
+                                    logits = self.model(**inputs).logits
+                                    probability = torch.softmax(logits, dim=-1)[0, self.positive_index].item()
+                                return {"toxicity": probability}
+
+                        self._toxicity_model = _TamilAbuse(model, tokenizer, abuse_index)
                     finally:
                         stop_heartbeat.set()
                         heartbeat_thread.join(timeout=1.0)
+                else:
+                    try:
+                        from detoxify import Detoxify
+                        stop_heartbeat, heartbeat_thread = _start_speech_heartbeat("Multilingual toxicity model loading")
+                        try:
+                            self._toxicity_model = Detoxify("multilingual", device="cpu")
+                        finally:
+                            stop_heartbeat.set()
+                            heartbeat_thread.join(timeout=1.0)
+                    except ImportError:
+                        logger.info("detoxify package not found; loading %s via transformers", TOXICITY_MODEL_ID)
+                        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+                        import torch
+                        stop_heartbeat, heartbeat_thread = _start_speech_heartbeat("Transformers toxicity model loading")
+                        try:
+                            tok = AutoTokenizer.from_pretrained(TOXICITY_MODEL_ID)
+                            mdl = AutoModelForSequenceClassification.from_pretrained(TOXICITY_MODEL_ID)
+                            mdl.eval()
+                            class _HFToxicity:
+                                def __init__(self, m, t):
+                                    self.m = m
+                                    self.t = t
+                                def predict(self, txt: str):
+                                    inputs = self.t(txt, return_tensors="pt", truncation=True, max_length=512)
+                                    with torch.inference_mode():
+                                        logits = self.m(**inputs).logits
+                                        probs = torch.sigmoid(logits)[0].tolist()
+                                    return {"toxicity": probs[0] if probs else 0.0}
+                            self._toxicity_model = _HFToxicity(mdl, tok)
+                        finally:
+                            stop_heartbeat.set()
+                            heartbeat_thread.join(timeout=1.0)
                 logger.info("Multilingual toxicity model loaded")
             result = self._toxicity_model.predict(text)
             value = result.get("toxicity") if isinstance(result, dict) else None
             score = float(np.asarray(value).reshape(-1)[0]) if value is not None else None
-            return score if score is not None and np.isfinite(score) else None
+            if score is None or not np.isfinite(score):
+                self._last_toxicity_status = "unavailable"
+                return None
+            self._last_toxicity_model_id = model_key
+            self._last_toxicity_status = "scored"
+            self._toxicity_models_used.add(model_key)
+            return score
         except Exception as exc:
             self._toxicity_error = f"{type(exc).__name__}: {exc}"
+            self._toxicity_model_errors[model_key] = self._toxicity_error
+            self._last_toxicity_status = "unavailable"
             logger.warning("Multilingual toxicity classifier unavailable: %s", exc)
             return None
 
     def release_models(self) -> None:
         """Release the optional toxicity model before the AudioSet model is loaded."""
         self._toxicity_model = None
+        self._toxicity_model_key = None
         gc.collect()
 
     # -----------------------------------------------------------------------
@@ -403,7 +484,7 @@ class VerbalAbuseDetector:
             confidence=conf,
             detection_source=detection_source,
             details={"matches_count": len(flagged), "toxicity_score": toxicity_score,
-                     "toxicity_model": TOXICITY_MODEL_ID if toxicity_score is not None else None},
+                     "toxicity_model": self._last_toxicity_model_id if toxicity_score is not None else None},
             language=language,
         )
 
@@ -708,6 +789,9 @@ class VerbalAbuseDetector:
                         f"Scoring speech segment {segment_index}/{len(asr_segments)} ({segment.language or 'language unknown'})",
                     )
                     toxicity = self._score_multilingual_toxicity(segment.text, segment.language)
+                    segment.toxicity_score = toxicity
+                    segment.toxicity_model = self._last_toxicity_model_id
+                    segment.toxicity_status = self._last_toxicity_status
                     span = self.analyze_text(
                         segment.text, segment.start_s, segment.end_s, "faster_whisper",
                         language=segment.language, toxicity_score=toxicity,
@@ -733,23 +817,38 @@ class VerbalAbuseDetector:
                            len(transcripts))
 
         detected_language = str(metadata.get("language") or "").split("-")[0].lower()
+        transcript_languages = sorted({str(item.language or "").split("-")[0].lower()
+                                       for item in transcripts if item.language})
+        scored_models = sorted(self._toxicity_models_used)
         if not self.use_multilingual_classifier:
             metadata["toxicity_classifier"] = {"status": "disabled"}
-        elif detected_language not in TOXICITY_MODEL_LANGUAGES:
+        elif scored_models:
+            models = [TOXICITY_MODEL_ID if key == TOXICITY_MODEL_ID else key for key in scored_models]
             metadata["toxicity_classifier"] = {
-                "status": "unsupported_language", "language": detected_language or None,
-                "supported_languages": sorted(TOXICITY_MODEL_LANGUAGES),
+                "status": "completed", "model": models[0] if len(models) == 1 else None,
+                "models": models,
+                "supported_languages": sorted(TOXICITY_MODEL_LANGUAGES | {"ta"}),
+                "scored_segments": sum(item.toxicity_score is not None for item in transcripts),
+                "language_note": (
+                    "Tamil scorer is trained for Tamil/code-mixed abusive-language detection; "
+                    "it is not validated for every dialect or ASR transcript."
+                    if TAMIL_ABUSE_MODEL_ID in self._toxicity_models_used else None
+                ),
+                "errors": dict(self._toxicity_model_errors),
             }
-        elif self._toxicity_error:
-            metadata["toxicity_classifier"] = {"status": "unavailable", "error": self._toxicity_error}
-            warning = "Optional multilingual toxicity scoring is unavailable: " + self._toxicity_error
-            if "No module named 'detoxify'" in self._toxicity_error:
-                warning += ". Enable the pretrained scorer in the app's active environment with: python -m pip install -r requirements.txt"
-            warnings.append(warning + ". Transcription and phrase checks continue, but no multilingual toxicity score was produced.")
-        elif self._toxicity_model is not None:
+            if self._toxicity_model_errors:
+                warnings.append("Some language-specific toxicity/abuse scores could not be produced: "
+                                + "; ".join(f"{model}: {error}" for model, error in self._toxicity_model_errors.items()))
+        elif self._toxicity_model_errors:
+            errors = dict(self._toxicity_model_errors)
+            metadata["toxicity_classifier"] = {"status": "unavailable", "errors": errors}
+            warnings.append("Optional toxicity/abuse scoring failed: "
+                            + "; ".join(f"{model}: {error}" for model, error in errors.items()))
+        elif not any(language in TOXICITY_MODEL_LANGUAGES or language in TAMIL_ABUSE_MODEL_LANGUAGES
+                     for language in transcript_languages or [detected_language]):
             metadata["toxicity_classifier"] = {
-                "status": "completed", "model": TOXICITY_MODEL_ID,
-                "supported_languages": sorted(TOXICITY_MODEL_LANGUAGES),
+                "status": "unsupported_language", "languages": transcript_languages or [detected_language or None],
+                "supported_languages": sorted(TOXICITY_MODEL_LANGUAGES | {"ta"}),
             }
         else:
             metadata["toxicity_classifier"] = {"status": "no_scored_speech"}

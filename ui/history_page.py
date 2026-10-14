@@ -5,19 +5,15 @@ from pathlib import Path
 import streamlit as st
 
 from database.repository import Repository
-from ui.common import STATUS_HELP, ft, goto, status_badge
+from ui.common import STATUS_HELP, ft, goto, render_page_header, status_badge
 
 
 def render(repo: Repository) -> None:
-    st.markdown(
-        "<div style='margin-bottom:1.5rem;'>"
-        "<h2 style='margin:0; font-size:1.75rem; font-weight:700; color:#F8FAFC; letter-spacing:-0.02em;'>"
-        "Video Analysis History"
-        "</h2>"
-        "<p style='margin:4px 0 0 0; color:#94A3B8; font-size:0.9rem;'>"
-        "Catalog of previously analyzed animation videos, detection results, and saved reports."
-        "</p></div>",
-        unsafe_allow_html=True
+    render_page_header(
+        title="Video Analysis History",
+        subtitle="Catalog of previously analyzed animation videos, detection sessions, and persistent audit reports.",
+        badge_text="Audit Archive",
+        badge_color="#6366F1"
     )
 
     repo.refresh_file_availability()
@@ -25,11 +21,14 @@ def render(repo: Repository) -> None:
 
     if not runs:
         st.markdown(
-            "<div style='text-align:center; padding:3.5rem 2rem; background:#111827; border-radius:8px; border:1px dashed rgba(255,255,255,0.15);'>"
-            "<div style='font-size:2.5rem; margin-bottom:0.5rem; color:#64748B;'>📁</div>"
-            "<h3 style='color:#F8FAFC; font-weight:600; margin-bottom:0.4rem;'>No Video History Yet</h3>"
-            "<p style='color:#94A3B8; max-width:480px; margin:0 auto 1.5rem auto; font-size:0.88rem;'>"
-            "Analyze a cartoon video to generate and save your first detection report."
+            "<div style='text-align:center; padding:3.5rem 2rem; background:rgba(17,24,39,0.7); "
+            "backdrop-filter:blur(10px); border-radius:12px; border:1px dashed rgba(255,255,255,0.15); margin-top:1rem;'>"
+            "<div style='width:56px; height:56px; border-radius:14px; background:rgba(99,102,241,0.12); "
+            "border:1px solid rgba(99,102,241,0.25); display:inline-flex; align-items:center; justify-content:center; "
+            "font-size:1.8rem; margin-bottom:1rem;'>📁</div>"
+            "<h3 style='color:#F8FAFC; font-weight:700; margin-bottom:0.4rem; font-size:1.25rem;'>No Video History Yet</h3>"
+            "<p style='color:#94A3B8; max-width:480px; margin:0 auto 1.5rem auto; font-size:0.9rem; line-height:1.5;'>"
+            "Analyze a cartoon video to generate and record your first detection report."
             "</p></div>",
             unsafe_allow_html=True
         )
@@ -52,10 +51,10 @@ def render(repo: Repository) -> None:
                 st.success(f"Cleared {n_deleted} reports from history.")
                 st.rerun()
 
-    # Search & Filter
+    # Search & Filter Bar
     c_search, c_filt = st.columns([3, 2])
     with c_search:
-        search_query = st.text_input("Search Videos by Filename", placeholder="Enter filename to filter...")
+        search_query = st.text_input("Search Videos by Filename", placeholder="Filter by video name...")
     with c_filt:
         status_filter = st.selectbox("Filter by Status", ["All Statuses", "Completed", "Warnings", "Failed / Interrupted"])
 
@@ -70,32 +69,33 @@ def render(repo: Repository) -> None:
         filtered_runs = [r for r in filtered_runs if r["status"] in ("failed", "interrupted", "incomplete")]
 
     st.markdown(
-        f"<div style='color:#64748B; font-size:0.8rem; margin-bottom:0.75rem;'>"
+        f"<div style='color:#94A3B8; font-size:0.8rem; margin:0.5rem 0 1rem 0;'>"
         f"Showing <b>{len(filtered_runs)}</b> of {len(runs)} recorded sessions</div>",
         unsafe_allow_html=True
     )
 
     for r in filtered_runs:
         elapsed = "—" if r["elapsed_s"] is None else f"{r['elapsed_s']:.1f}s"
-        avail = "● Video Stored" if r["file_available"] else "○ Video Removed (Data Kept)"
+        avail = "● Video Cached" if r["file_available"] else "○ Video Removed (Data Kept)"
         avail_color = "#10B981" if r["file_available"] else "#64748B"
 
         with st.container():
             st.markdown(
-                f"<div style='background:#111827; border:1px solid rgba(255,255,255,0.08); border-left:3px solid #3B82F6; "
-                f"border-radius:6px; padding:1.1rem; margin-bottom:0.5rem;'>"
+                f"<div style='background:rgba(17,24,39,0.75); backdrop-filter:blur(8px); "
+                f"border:1px solid rgba(255,255,255,0.08); border-left:3px solid #3B82F6; "
+                f"border-radius:9px; padding:1.15rem 1.25rem; margin-bottom:0.75rem; box-shadow:0 2px 8px rgba(0,0,0,0.25);'>"
                 f"<div style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;'>"
                 f"<div>"
                 f"<span style='font-size:1.05rem; font-weight:700; color:#F8FAFC;'>{r['original_name']}</span>"
-                f"<span style='color:#64748B; font-size:0.82rem; margin-left:8px;'>Run #{r['id']}</span>"
+                f"<span style='color:#64748B; font-size:0.78rem; margin-left:8px; font-weight:600;'>#Run {r['id']}</span>"
                 f"</div>"
                 f"<div style='font-size:0.78rem; color:#94A3B8;'>{r['started_at'][:19]}</div>"
                 f"</div>"
-                f"<div style='display:flex; gap:16px; align-items:center; margin-top:6px; flex-wrap:wrap; font-size:0.82rem; color:#94A3B8;'>"
+                f"<div style='display:flex; gap:16px; align-items:center; margin-top:8px; flex-wrap:wrap; font-size:0.82rem; color:#CBD5E1;'>"
                 f"<span>Duration: <b>{ft(r['duration_s'])}</b></span>"
-                f"<span>Analysis Time: <b>{elapsed}</b></span>"
+                f"<span>Compute Latency: <b>{elapsed}</b></span>"
                 f"<span>Windows: <b>{r['windows_done']}/{r['windows_total']}</b></span>"
-                f"<span style='color:{avail_color}; font-weight:500;'>{avail}</span>"
+                f"<span style='color:{avail_color}; font-weight:600;'>{avail}</span>"
                 f"</div></div>",
                 unsafe_allow_html=True
             )
@@ -107,7 +107,7 @@ def render(repo: Repository) -> None:
                     st.caption(f"Note: {r['error']}")
 
             with c2:
-                st.button("Open Report", key=f"hist_open_{r['id']}", on_click=goto,
+                st.button("Open Report →", key=f"hist_open_{r['id']}", on_click=goto,
                           args=("Report",), kwargs={"selected_run_id": r["id"]}, use_container_width=True)
 
             with c3:
@@ -123,10 +123,10 @@ def render(repo: Repository) -> None:
                         except OSError as e:
                             st.error(f"Could not delete file: {e}")
                 else:
-                    st.caption("File removed")
+                    st.caption("Cached file removed")
 
             with c4:
-                if st.button("🗑️ Delete Report", key=f"hist_del_run_{r['id']}",
+                if st.button("🗑️ Delete Run", key=f"hist_del_run_{r['id']}",
                              help="Permanently delete this analysis report and associated evidence from the database",
                              use_container_width=True):
                     repo.delete_run(r["id"])
@@ -135,4 +135,4 @@ def render(repo: Repository) -> None:
                     st.success(f"Report for Run #{r['id']} was deleted.")
                     st.rerun()
 
-            st.markdown("<div style='height: 0.75rem;'></div>", unsafe_allow_html=True)
+            st.markdown("<div style='height: 0.5rem;'></div>", unsafe_allow_html=True)

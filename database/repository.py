@@ -33,6 +33,11 @@ class Repository:
             self.conn.execute("ALTER TABLE events ADD COLUMN qwen_explanation TEXT")
         if "qwen_status" not in columns:
             self.conn.execute("ALTER TABLE events ADD COLUMN qwen_status TEXT")
+        video_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(videos)")}
+        if "video_title" not in video_columns:
+            self.conn.execute("ALTER TABLE videos ADD COLUMN video_title TEXT")
+        if "title_source" not in video_columns:
+            self.conn.execute("ALTER TABLE videos ADD COLUMN title_source TEXT NOT NULL DEFAULT 'filename'")
         self.conn.execute("UPDATE schema_info SET version=?", (SCHEMA_VERSION,))
 
     def close(self) -> None:
@@ -58,6 +63,14 @@ class Repository:
         with transaction(self.conn):
             self.conn.execute("UPDATE videos SET stored_path=?, file_available=? WHERE id=?",
                               (stored_path, int(available), video_id))
+
+    def set_video_title_context(self, video_id: int, title: str, source: str = "filename") -> None:
+        """Store the human-readable title clue and whether it came from YouTube metadata or a filename."""
+        if source not in ("youtube", "filename"):
+            raise ValueError("title source must be 'youtube' or 'filename'")
+        with transaction(self.conn):
+            self.conn.execute("UPDATE videos SET video_title=?, title_source=? WHERE id=?",
+                              (str(title), source, video_id))
 
     def refresh_file_availability(self) -> None:
         with transaction(self.conn):
@@ -196,27 +209,6 @@ class Repository:
                 [(run_id, w.index, w.start_s, w.end_s, w.p_violent, w.status, json.dumps(w.frame_indices),
                   json.dumps(w.frame_times), w.inference_ms, w.note) for w in windows])
 
-    def add_model_window_scores(self, run_id: int, model_key: str, rows: list[dict]) -> None:
-        """Persist optional comparison outputs without changing X3D window predictions."""
-        if not rows:
-            return
-        with transaction(self.conn):
-            self.conn.executemany(
-                "INSERT INTO model_window_predictions(run_id, model_key, window_index, start_s, end_s, "
-                "p_violent, status, inference_ms, note) VALUES (?,?,?,?,?,?,?,?,?)",
-                [(run_id, model_key, int(r["window_index"]), float(r["start_s"]), float(r["end_s"]),
-                  r.get("p_violent"), r.get("status", "ok"), r.get("inference_ms"), r.get("note")) for r in rows])
-
-    def list_model_window_scores(self, run_id: int, model_key: str | None = None):
-        if model_key is None:
-            return self.conn.execute(
-                "SELECT * FROM model_window_predictions WHERE run_id=? ORDER BY model_key, window_index", (run_id,)
-            ).fetchall()
-        return self.conn.execute(
-            "SELECT * FROM model_window_predictions WHERE run_id=? AND model_key=? ORDER BY window_index",
-            (run_id, model_key),
-        ).fetchall()
-
     def list_windows(self, run_id: int):
         return self.conn.execute("SELECT * FROM window_predictions WHERE run_id=? ORDER BY window_index",
                                  (run_id,)).fetchall()
@@ -266,6 +258,12 @@ class Repository:
     def list_audio_segments(self, run_id: int):
         return self.conn.execute("SELECT * FROM audio_segments WHERE run_id=? ORDER BY start_s, id",
                                  (run_id,)).fetchall()
+
+    def update_audio_segment_details(self, segment_id: int, details: dict) -> None:
+        """Update supplemental scoring metadata for an already-saved transcript."""
+        with transaction(self.conn):
+            self.conn.execute("UPDATE audio_segments SET details_json=? WHERE id=?",
+                              (json.dumps(details, ensure_ascii=False), int(segment_id)))
 
     # ---- reviews (append-only, separate from model output) ----
     def add_review(self, event_id: int, decision: str, notes: str = "", human_severity: int | None = None) -> int:

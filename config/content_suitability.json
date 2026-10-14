@@ -1,0 +1,100 @@
+{
+  "nursery_rhyme_phrases": [
+    "nursery rhyme",
+    "nursery rhymes",
+    "preschool",
+    "kids song",
+    "kids songs",
+    "children song",
+    "children's song",
+    "preschool song",
+    "preschool learning",
+    "toddler song",
+    "johnny johnny yes papa",
+    "wheels on the bus",
+    "twinkle twinkle little star",
+    "baa baa black sheep",
+    "old macdonald had a farm",
+    "humpty dumpty",
+    "mary had a little lamb",
+    "itsy bitsy spider",
+    "baby shark"
+  ],
+  "potential_conflict_phrases": [
+    "army",
+    "military",
+    "armed forces",
+    "soldier",
+    "soldiers",
+    "afghanistan",
+    "afganistan",
+    "war",
+    "battle",
+    "combat",
+    "gunfight",
+    "shooting",
+    "battlefield",
+    "military operation"
+  ],
+  "concerning_title_phrases": [
+    "violent",
+    "violence",
+    "brutal",
+    "bloodbath",
+    "gore",
+    "gory",
+    "murder",
+    "killing",
+    "death scene",
+    "massacre",
+    "shooting",
+    "war scene"
+  ],
+  "abuse_phrases": {
+    "threat": {
+      "en": ["i will kill you", "i'll kill you", "kill you", "i will hurt you", "i'll hurt you", "shoot you", "beat you up", "i will destroy you"],
+      "ta": ["உன்னை கொல்ல", "கொன்று விடுவேன்", "அடித்து விடுவேன்", "சுட்டு விடுவேன்"]
+    },
+    "insult": {
+      "en": ["you are stupid", "you are an idiot", "you idiot", "shut up"],
+      "ta": ["முட்டாள்", "முட்டாளே", "பைத்தியம்"]
+    },
+    "profanity": {
+      "en": ["fuck", "fucking", "shit", "bullshit", "bitch", "asshole", "bastard", "damn"],
+      "ta": ["தேவடியா", "மயிர்", "ஒத்தா"]
+    }
+  },
+  "negations": {
+    "en": ["not", "no", "never", "don't", "dont", "didn't", "didnt", "isn't", "isnt", "wasn't", "wasnt", "won't", "wont", "without"],
+    "ta": ["இல்லை", "மாட்டேன்", "மாட்டாது", "வேண்டாம்"]
+  },
+  "assessment": {
+    "toxicity_threshold": 0.85,
+    "x3d_candidate_priority": 0.0
+  },
+  "text_score": {
+    "base_score": 6.0,
+    "title_match_youtube": 1.2,
+    "title_match_filename": 0.65,
+    "transcript_kids_phrase": 1.5,
+    "concerning_title_youtube_penalty": 1.5,
+    "concerning_title_filename_penalty": 0.75,
+    "conflict_title_penalty": 2.2,
+    "sentiment_scale": 0.25,
+    "sentiment_max_abs": 0.25,
+    "abuse_penalties": {
+      "threat": 3.6,
+      "profanity": 2.4,
+      "insult": 1.5,
+      "other": 1.5,
+      "toxicity": 2.0,
+      "max_total": 4.0
+    },
+    "bands": [
+      {"minimum": 7.5, "label": "Likely child-friendly"},
+      {"minimum": 6.0, "label": "Neutral / needs further analysis"},
+      {"minimum": 4.0, "label": "Potentially unsuitable"},
+      {"minimum": 0.0, "label": "Higher concern / review required"}
+    ]
+  }
+}

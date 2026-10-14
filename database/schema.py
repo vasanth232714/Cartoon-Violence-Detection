@@ -1,4 +1,4 @@
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL);
@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS videos (
     frame_count INTEGER NOT NULL,
     container TEXT,
     fourcc TEXT,
+    video_title TEXT,
+    title_source TEXT NOT NULL DEFAULT 'filename',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -55,22 +57,6 @@ CREATE TABLE IF NOT EXISTS window_predictions (
     UNIQUE(run_id, window_index)
 );
 
--- Additional model outputs are kept separately from the X3D baseline probabilities.
-CREATE TABLE IF NOT EXISTS model_window_predictions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
-    model_key TEXT NOT NULL,
-    window_index INTEGER NOT NULL,
-    start_s REAL NOT NULL,
-    end_s REAL NOT NULL,
-    p_violent REAL,
-    status TEXT NOT NULL,
-    inference_ms REAL,
-    note TEXT,
-    UNIQUE(run_id, model_key, window_index)
-);
-CREATE INDEX IF NOT EXISTS idx_model_window_run_model ON model_window_predictions(run_id, model_key, window_index);
-
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
@@ -101,7 +87,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS audio_segments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL,             -- transcript|verbal_abuse|audio_event|processing_note
+    kind TEXT NOT NULL,             -- transcript|verbal_abuse|abuse_keyword|audio_event|processing_note
     start_s REAL NOT NULL,
     end_s REAL NOT NULL,
     language TEXT,

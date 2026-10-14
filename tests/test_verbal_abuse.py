@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import tempfile
+import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import torch
 
 from models.verbal_abuse_detector import (
     CAT_HATE,
@@ -70,6 +75,47 @@ class TestVerbalAbuseDetector(unittest.TestCase):
         self.assertEqual(span.categories, ["Toxic language candidate"])
         self.assertEqual(span.severity_level, "Not assessed")
         self.assertEqual(span.flagged_words, [])
+
+    def test_tamil_uses_tamil_abuse_model_and_verified_abusive_label(self):
+        class FakeTokenizer:
+            @classmethod
+            def from_pretrained(cls, model_id):
+                return cls()
+
+            def __call__(self, text, **kwargs):
+                return {"input_ids": torch.tensor([[1, 2]])}
+
+        class FakeModel:
+            config = types.SimpleNamespace(
+                id2label={0: "LABEL_0", 1: "LABEL_1"}, num_labels=2,
+            )
+
+            @classmethod
+            def from_pretrained(cls, model_id):
+                return cls()
+
+            def eval(self):
+                return self
+
+            def __call__(self, **inputs):
+                return types.SimpleNamespace(logits=torch.tensor([[0.0, 3.0]]))
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoTokenizer = FakeTokenizer
+        fake_transformers.AutoModelForSequenceClassification = FakeModel
+        with patch.dict(sys.modules, {"transformers": fake_transformers}):
+            detector = VerbalAbuseDetector(use_multilingual_classifier=True)
+            score = detector._score_multilingual_toxicity("தமிழ் உரை", "ta")
+
+        self.assertAlmostEqual(score, 0.9526, places=3)
+        self.assertEqual(detector._last_toxicity_status, "scored")
+        self.assertEqual(detector._last_toxicity_model_id,
+                         "Hate-speech-CNERG/tamil-codemixed-abusive-MuRIL")
+
+    def test_unsupported_language_reports_reason_instead_of_loading_wrong_model(self):
+        detector = VerbalAbuseDetector(use_multilingual_classifier=True)
+        self.assertIsNone(detector._score_multilingual_toxicity("తెలుగు వాక్యం", "te"))
+        self.assertEqual(detector._last_toxicity_status, "unsupported_language")
 
     def test_censor_text(self):
         censored = self.detector.censor_text("Hey you idiot, shut up!")

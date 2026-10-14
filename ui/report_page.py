@@ -1,147 +1,49 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from collections import Counter
 
+from config.settings import AnalysisConfig
 from database.repository import COMPLETE_STATUSES, Repository
 from pipeline.report_pdf import build_pdf
-from ui.common import STATUS_HELP, ft, jload, render_hero_metric, severity_badge, status_badge
+from ui.common import STATUS_HELP, ft, jload, render_hero_metric, render_page_header, severity_badge, status_badge
 from ui.event_investigation import render_event, review_status
 from ui.timeline import build_timeline_figure
 from models.vlm_explainer import (
     QWEN_MIN_AVAILABLE_RAM_BYTES,
     _available_physical_memory_bytes,
-    parse_structured_explanation,
     parse_qwen_visual_review,
 )
 from pipeline.qwen_phase import audit_full_video_with_qwen, explain_run_candidates
+from pipeline.progressive_stages import (
+    persist_stage_status,
+    rescore_saved_transcripts,
+    run_audio_stage,
+    run_speech_stage,
+)
+from pipeline.content_suitability import (
+    analyze_text_suitability,
+    build_suitability_assessment,
+    classify_title,
+)
 
-
-def _render_videomae_comparison(repo: Repository, run_id: int, windows, run_info: dict, cfg: dict,
-                                duration_s: float) -> None:
-    """Show independent window scores, agreement, disagreements, and each model's candidates."""
-    metadata = run_info.get("videomae_comparison") or {}
-    if not metadata:
-        return
-    st.markdown("#### Optional model comparison · X3D baseline vs VideoMAE")
-    if metadata.get("status") == "failed":
-        st.warning(f"VideoMAE comparison failed: {metadata.get('error', 'see run warnings')}")
-        return
-    scores = repo.list_model_window_scores(run_id, "videomae")
-    if not scores:
-        st.info("VideoMAE was enabled, but no comparison window scores were saved.")
-        return
-
-    x3d_threshold = float(cfg.get("threshold", 0.75))
-    videomae_threshold = float(metadata.get("candidate_threshold", cfg.get("videomae_threshold", 0.50)))
-    x3d_by_index = {int(row["window_index"]): row for row in windows}
-    mae_by_index = {int(row["window_index"]): row for row in scores}
-    common = sorted(set(x3d_by_index) & set(mae_by_index))
-    valid = [i for i in common if x3d_by_index[i]["p_violent"] is not None
-             and mae_by_index[i]["p_violent"] is not None]
-    if not valid:
-        st.warning("There are no windows with valid scores from both models to compare.")
-        return
-
-    x3d_pos = {i: float(x3d_by_index[i]["p_violent"]) >= x3d_threshold for i in valid}
-    mae_pos = {i: float(mae_by_index[i]["p_violent"]) >= videomae_threshold for i in valid}
-    n_agree = sum(x3d_pos[i] == mae_pos[i] for i in valid)
-    n_disagree = len(valid) - n_agree
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Comparable windows", len(valid))
-    c2.metric("Agreement", f"{n_agree / len(valid) * 100:.1f}%", f"{n_agree} windows")
-    c3.metric("Disagreement", n_disagree)
-    st.caption(
-        f"Independent thresholds: X3D {x3d_threshold:.2f} · VideoMAE {videomae_threshold:.2f}. "
-        "Scores are displayed separately; no averaging or calibration is applied. Agreement is not ground-truth accuracy."
-    )
-    st.caption(
-        f"Model card: {metadata.get('model_id', 'HappyGook/videomae-violence-detector')} · "
-        f"{metadata.get('num_frames', 16)} frames at {metadata.get('input_size', 224)}px · "
-        f"device: {metadata.get('device', 'CPU')} · status: {metadata.get('status', 'unknown')}. "
-        "Trained on UCF-Crime and bus-surveillance footage; cartoon performance has not been evaluated."
-    )
-
-    centers = [(float(x3d_by_index[i]["start_s"]) + float(x3d_by_index[i]["end_s"])) / 2 for i in valid]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=centers, y=[float(x3d_by_index[i]["p_violent"]) for i in valid],
-                             mode="lines+markers", name="X3D baseline score", line=dict(color="#3B82F6")))
-    fig.add_trace(go.Scatter(x=centers, y=[float(mae_by_index[i]["p_violent"]) for i in valid],
-                             mode="lines+markers", name="VideoMAE score", line=dict(color="#A78BFA")))
-    fig.add_hline(y=x3d_threshold, line_dash="dash", line_color="#3B82F6",
-                  annotation_text=f"X3D threshold {x3d_threshold:.2f}")
-    fig.add_hline(y=videomae_threshold, line_dash="dot", line_color="#A78BFA",
-                  annotation_text=f"VideoMAE threshold {videomae_threshold:.2f}")
-    fig.update_layout(height=340, xaxis_title="Video time (seconds)", yaxis_title="Model score (uncalibrated)",
-                      yaxis_range=[0, 1.05], xaxis_range=[0, duration_s],
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      font=dict(color="#94A3B8"), margin=dict(l=10, r=10, t=35, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-    window_score_rows = [{
-        "Window": i + 1,
-        "Time": f"{ft(x3d_by_index[i]['start_s'])} → {ft(x3d_by_index[i]['end_s'])}",
-        "X3D score": f"{float(x3d_by_index[i]['p_violent']):.4f}",
-        "VideoMAE score": f"{float(mae_by_index[i]['p_violent']):.4f}",
-        "X3D decision": "candidate" if x3d_pos[i] else "below threshold",
-        "VideoMAE decision": "candidate" if mae_pos[i] else "below threshold",
-        "Comparison": "agree" if x3d_pos[i] == mae_pos[i] else "disagree",
-    } for i in valid]
-    with st.expander("All paired window scores", expanded=False):
-        st.dataframe(pd.DataFrame(window_score_rows), use_container_width=True, hide_index=True)
-
-    disagreements = []
-    for i in valid:
-        if x3d_pos[i] == mae_pos[i]:
-            continue
-        xrow, mrow = x3d_by_index[i], mae_by_index[i]
-        disagreements.append({
-            "Window": i + 1,
-            "Time": f"{ft(xrow['start_s'])} → {ft(xrow['end_s'])}",
-            "Decision": "X3D only" if x3d_pos[i] else "VideoMAE only",
-            "X3D score": f"{float(xrow['p_violent']):.3f}",
-            "VideoMAE score": f"{float(mrow['p_violent']):.3f}",
-        })
-    with st.expander(f"Disagreeing windows ({len(disagreements)})", expanded=False):
-        if disagreements:
-            st.dataframe(pd.DataFrame(disagreements), use_container_width=True, hide_index=True)
-        else:
-            st.caption("No disagreeing windows at the configured thresholds.")
-
-    from pipeline.event_segmenter import WindowPrediction, segment_events
-
-    def candidate_rows(model_name: str, source_rows, threshold: float):
-        predictions = [WindowPrediction(
-            index=int(row["window_index"]), start_s=float(row["start_s"]), end_s=float(row["end_s"]),
-            p_violent=float(row["p_violent"]) if row["p_violent"] is not None else None,
-            status=str(row["status"]),
-        ) for row in source_rows]
-        candidates = segment_events(predictions, threshold, float(cfg.get("merge_gap_seconds", 1.0)), 0.0)
-        return [{
-            "Model": model_name,
-            "Candidate interval": f"{ft(event.start_s)} → {ft(event.end_s)}",
-            "Duration": f"{event.duration_s:.1f}s",
-            "Peak score": f"{event.peak_prob:.3f}",
-            "Windows": event.n_windows,
-        } for event in candidates]
-
-    candidate_data = candidate_rows("X3D", windows, x3d_threshold)
-    candidate_data += candidate_rows("VideoMAE", scores, videomae_threshold)
-    st.markdown("**Candidate intervals by model**")
-    if candidate_data:
-        st.dataframe(pd.DataFrame(candidate_data), use_container_width=True, hide_index=True)
-    else:
-        st.caption("Neither model produced a candidate interval at its own threshold.")
+logger = logging.getLogger(__name__)
 
 
 def _render_qwen_phase(repo: Repository, run_id: int, video, events) -> None:
     """Offer Qwen as an explicit second step after the complete candidate list is saved."""
-    st.markdown("#### Phase 2 · Check candidates and explain them with Qwen")
+    st.markdown(
+        "<div style='margin-top:1.5rem; margin-bottom:0.5rem; display:flex; align-items:center; gap:8px;'>"
+        "<span style='font-size:1.15rem;'>🧠</span>"
+        "<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:700; margin:0;'>Phase 2 · Candidate Explanations (Qwen2.5-VL)</h4>"
+        "</div>",
+        unsafe_allow_html=True
+    )
     pending = [event for event in events
                if event["qwen_status"] != "generated" or not event["qwen_explanation"]
                or not parse_qwen_visual_review(event["qwen_explanation"])["structured"]]
@@ -153,7 +55,7 @@ def _render_qwen_phase(repo: Repository, run_id: int, video, events) -> None:
             f"{generated} explained · {len(pending)} remaining."
         )
     else:
-        st.info("Run the candidate scan first. Qwen runs only after candidate intervals are saved.")
+        st.info("Run candidate detection first. Qwen explanations run after candidate intervals are identified.")
         return
 
     notice_key = f"qwen_phase_notice_{run_id}"
@@ -193,19 +95,19 @@ def _render_qwen_phase(repo: Repository, run_id: int, video, events) -> None:
         free_gib = available / 1024**3
         required_gib = QWEN_MIN_AVAILABLE_RAM_BYTES / 1024**3
         st.warning(
-            f"Qwen needs about {required_gib:.0f} GiB of available RAM with its lower-memory pretrained weights. "
-            f"This machine currently has {free_gib:.1f} GiB available. Candidate detection is complete; "
-            "free more memory or use a higher-memory machine to run explanations."
+            f"Qwen requires ~{required_gib:.0f} GiB available RAM with its pretrained weights. "
+            f"This environment currently reports {free_gib:.1f} GiB available. "
+            "Candidate detection is complete; free memory to run explanations."
         )
     elif available is None:
-        st.caption("Qwen uses the checkpoint's bfloat16 weights and reduced frame resolution; allow about 8 GiB of free RAM for CPU review.")
+        st.caption("Qwen uses pretrained bfloat16 weights; allow about 8 GiB of free RAM for CPU evaluation.")
 
     source_available = Path(video["stored_path"]).is_file()
     if not source_available:
         st.warning("The original video file is unavailable. Restore or re-upload it before running Qwen.")
 
     if st.button(
-        f"🔎 Review and explain {len(pending)} remaining candidates with Qwen",
+        f"🔎 Review and explain {len(pending)} remaining candidate(s) with Qwen2.5-VL",
         type="primary",
         use_container_width=True,
         disabled=memory_blocked or not source_available,
@@ -230,14 +132,398 @@ def _render_qwen_phase(repo: Repository, run_id: int, video, events) -> None:
             st.rerun()
 
 
+def _render_stage_findings(repo: Repository, run_id: int, video, cfg: dict, model_info: dict) -> None:
+    """Run audio then speech once each, preserving completed output across Streamlit reruns."""
+    persisted = model_info.get("analysis_stages") or {}
+    if not persisted:
+        return
+    key = f"progressive_analysis_{run_id}"
+    state = st.session_state.get(key)
+    if not isinstance(state, dict):
+        state = {"run_id": run_id, "video_id": int(video["id"]), "results": {}}
+        for stage in ("visual", "audio", "speech"):
+            value = dict(persisted.get(stage) or {})
+            status = value.get("status", "pending")
+            if status == "running":
+                status = "pending"
+            state[stage] = {**value, "status": status}
+        st.session_state[key] = state
+    if state.get("video_id") != int(video["id"]):
+        state = {"run_id": run_id, "video_id": int(video["id"]), "results": {},
+                 "visual": {"status": "completed"}, "audio": {"status": "pending"},
+                 "speech": {"status": "pending"}}
+        st.session_state[key] = state
+    state.setdefault("results", {})
+    for stage in ("audio", "speech"):
+        if state[stage].get("status") == "running":
+            state[stage]["status"] = "pending"
+            persist_stage_status(repo, run_id, stage, "pending")
+
+    if state["visual"].get("status") != "completed":
+        st.error(f"Visual stage status: {state['visual'].get('status', 'unknown')}")
+        return
+
+    source_path = Path(video["stored_path"])
+    source_available = source_path.is_file()
+    duration_s = float(video["duration_s"])
+
+    config = AnalysisConfig(**{k: v for k, v in cfg.items() if k in AnalysisConfig.__dataclass_fields__})
+
+    def run_stage(stage: str, title: str, action):
+        current = state[stage]
+        if current.get("status") != "pending":
+            return
+        current.update(status="running", error=None)
+        state[stage] = current
+        st.session_state[key] = state
+        persist_stage_status(repo, run_id, stage, "running")
+        progress_bar = st.progress(0.0)
+        message = st.empty()
+
+        def on_progress(fraction: float, text: str):
+            progress_bar.progress(max(0.0, min(float(fraction), 1.0)))
+            message.caption(text)
+
+        try:
+            result = action(on_progress)
+            current.update(status="completed", error=None)
+            state["results"][stage] = result
+        except Exception as exc:
+            current.update(status="failed", error=str(exc))
+        finally:
+            state[stage] = current
+            st.session_state[key] = state
+            persist_stage_status(repo, run_id, stage, current["status"], current.get("error"))
+            progress_bar.empty()
+            message.empty()
+            st.rerun()
+
+    st.markdown("<div style='height: 1.5rem;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;'>"
+        "<h3 style='color:#F8FAFC; font-size:1.2rem; font-weight:700; margin:0;'>Multi-Modal Audio & Speech Findings</h3>"
+        "<span style='font-size:0.75rem; color:#94A3B8;'>Independent Sound & Language Channels</span>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+    audio_meta = (model_info.get("audio_event_analysis") or {})
+    st.caption(f"Sound-event detection · Status: {state['audio'].get('status', 'pending').title()}")
+    if state["audio"].get("status") == "pending":
+        run_stage("audio", "Analyzing audio and detecting sound events…",
+                  lambda callback: run_audio_stage(repo, run_id, str(source_path), config, callback))
+    audio_state = state["audio"]
+    if audio_state.get("status") == "failed":
+        st.error(f"Sound-event analysis error: {audio_state.get('error', audio_meta.get('error', 'unknown error'))}")
+    elif audio_state.get("status") == "completed":
+        segments = [row for row in repo.list_audio_segments(run_id) if row["kind"] == "audio_event"]
+        st.markdown("#### Sound-Event Candidates (AudioSet)")
+        if audio_meta.get("status") == "disabled" or not audio_meta.get("enabled", True):
+            st.info("Sound-event detection was disabled for this run.")
+        elif segments:
+            st.dataframe(pd.DataFrame([{
+                "Sound Label": row["category"] or "Sound candidate",
+                "Score": f"{float(row['confidence']):.3f}" if row["confidence"] is not None else "—",
+                "Time Interval": f"{ft(row['start_s'])} → {ft(row['end_s'])}",
+                "Source Model": row["source"] or "AudioSet AST",
+            } for row in segments]), use_container_width=True, hide_index=True)
+            for row in segments[:12]:
+                label = row["category"] or "Sound candidate"
+                with st.expander(f"🔊 Listen to {label} ({ft(row['start_s'])}–{ft(row['end_s'])})", expanded=False):
+                    if source_available:
+                        st.video(str(source_path), start_time=max(int(float(row["start_s"]) - 1), 0))
+                    st.caption("Source clip provided for auditory inspection.")
+        else:
+            st.info("No configured sound-event candidates were returned above threshold.")
+        audio_result = state.get("results", {}).get("audio")
+        if isinstance(audio_result, tuple) and len(audio_result) >= 3:
+            for warning in audio_result[2]:
+                st.warning(str(warning))
+
+    speech_meta = model_info.get("speech_analysis") or {}
+    st.caption(f"Speech transcription & verbal abuse · Status: {state['speech'].get('status', 'pending').title()}")
+    if state["speech"].get("status") == "pending":
+        run_stage("speech", "Transcribing speech and checking for verbal-abuse candidates…",
+                  lambda callback: run_speech_stage(repo, run_id, str(source_path), duration_s, config, callback))
+    speech_state = state["speech"]
+    if speech_state.get("status") == "failed":
+        st.error(f"Speech analysis error: {speech_state.get('error', speech_meta.get('error', 'unknown error'))}")
+    elif speech_state.get("status") == "completed":
+        segments = [row for row in repo.list_audio_segments(run_id) if row["kind"] == "transcript"]
+        abuse = [row for row in repo.list_audio_segments(run_id)
+                 if row["kind"] in ("verbal_abuse", "abuse_keyword")]
+        st.markdown("#### Whisper ASR Transcripts & Language Risk")
+        if speech_meta.get("status") == "disabled" or not speech_meta.get("enabled", True):
+            st.info("Speech analysis was disabled for this run.")
+        else:
+            languages = sorted({row["language"] for row in segments if row["language"]})
+            m1, m2, m3 = st.columns(3)
+            m1.markdown(render_hero_metric("Transcript Segments", len(segments), "📝", "Dialogue turns", "#3B82F6"), unsafe_allow_html=True)
+            m2.markdown(render_hero_metric("Languages Detected", len(languages), "🌐", ", ".join(languages) if languages else "None", "#6366F1"), unsafe_allow_html=True)
+            m3.markdown(render_hero_metric("Verbal Abuse Alerts", len(abuse), "⚠️", "Flagged phrases", "#EF4444"), unsafe_allow_html=True)
+            st.markdown("<div style='height: 0.75rem;'></div>", unsafe_allow_html=True)
+
+            if segments:
+                scoreable_languages = {"en", "fr", "es", "it", "pt", "tr", "ru", "ta", "tam", "tamil"}
+                missing_score_rows = [
+                    row for row in segments
+                    if (row["language"] or "").split("-")[0].lower() in scoreable_languages
+                    and (jload(row["details_json"], {}) or {}).get("toxicity_score") is None
+                ]
+                st.dataframe(pd.DataFrame([{
+                    "Time": f"{ft(row['start_s'])} → {ft(row['end_s'])}",
+                    "Language": (row["language"] or "unknown").upper(),
+                    "Transcript": row["text"] or "",
+                    "Toxicity Score": (
+                        f"{float((jload(row['details_json'], {}) or {}).get('toxicity_score')):.3f}"
+                        if (jload(row["details_json"], {}) or {}).get("toxicity_score") is not None
+                        else (
+                            "Not scored"
+                            if not (jload(row["details_json"], {}) or {}).get("toxicity_status")
+                            else str((jload(row["details_json"], {}) or {}).get("toxicity_status")).replace("_", " ").title()
+                        )),
+                    "Scorer": (
+                        "Tamil code-mixed abuse model"
+                        if "tamil-codemixed-abusive" in str((jload(row["details_json"], {}) or {}).get("toxicity_model", ""))
+                        else "Multilingual toxicity model"
+                        if (jload(row["details_json"], {}) or {}).get("toxicity_model")
+                        else "Not run"),
+                } for row in segments]), use_container_width=True, hide_index=True)
+                if missing_score_rows:
+                    st.info(
+                        f"{len(missing_score_rows)} transcript segment(s) lack toxicity score. "
+                        "You can score them retroactively below."
+                    )
+                    if st.button("Score Saved Transcripts for Toxicity", key=f"rescore_toxicity_{run_id}"):
+                        progress_bar = st.progress(0.0)
+                        progress_text = st.empty()
+
+                        def on_rescore_progress(fraction: float, message: str) -> None:
+                            progress_bar.progress(max(0.0, min(1.0, float(fraction))))
+                            progress_text.caption(message)
+
+                        try:
+                            with st.spinner("Scoring transcripts with text classifier…"):
+                                result = rescore_saved_transcripts(repo, run_id, on_rescore_progress)
+                            if result.get("status") == "completed":
+                                st.success(f"Scored {result.get('scored_segments', 0)} transcript segment(s).")
+                            else:
+                                st.error("No scores were produced. " + str(result.get("errors") or ""))
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not score transcripts: {exc}")
+                        finally:
+                            progress_bar.empty()
+                            progress_text.empty()
+            if abuse:
+                st.markdown("**Flagged Lexical Abuse Candidates**")
+                st.dataframe(pd.DataFrame([{
+                    "Time": f"{ft(row['start_s'])} → {ft(row['end_s'])}",
+                    "Language": (row["language"] or "unknown").upper(),
+                    "Flagged Phrase": (jload(row["details_json"], {}) or {}).get("censored_text") or row["text"] or "",
+                    "Categories": row["category"] or "—",
+                    "Score": f"{float(row['confidence']):.3f}" if row["confidence"] is not None else "Lexicon Rule",
+                } for row in abuse]), use_container_width=True, hide_index=True)
+                for row in abuse[:12]:
+                    with st.expander(f"🗣️ Review speech segment ({ft(row['start_s'])}–{ft(row['end_s'])})", expanded=False):
+                        if source_available:
+                            st.video(str(source_path), start_time=max(int(float(row["start_s"]) - 2), 0))
+            speech_result = state.get("results", {}).get("speech")
+            if isinstance(speech_result, tuple) and len(speech_result) >= 4:
+                for warning in speech_result[3]:
+                    st.warning(str(warning))
+
+    stages_done = state["audio"].get("status") in ("completed", "failed") and state["speech"].get("status") in ("completed", "failed")
+    if stages_done:
+        statuses = [state[stage].get("status") for stage in ("audio", "speech")]
+        if all(status == "completed" for status in statuses):
+            st.success("All multi-modal stages completed. Combined timeline and report are ready below.")
+        else:
+            st.warning("Analysis completed with warnings in optional stages.")
+        visual_items = []
+        for event in repo.list_events(run_id):
+            details = jload(event["severity_json"], {}) or {}
+            if details.get("visual_model"):
+                visual_items.append({"start_s": event["start_s"], "end_s": event["end_s"],
+                                     "label": f"X3D Visual · Event #{event['event_no']}",
+                                     "score": event["peak_prob"], "kind": "Visual"})
+        audio_rows = [row for row in repo.list_audio_segments(run_id)
+                      if row["kind"] in ("audio_event", "verbal_abuse", "abuse_keyword")]
+        for row in audio_rows:
+            visual_items.append({"start_s": row["start_s"], "end_s": row["end_s"],
+                                 "label": row["category"] or ("Speech abuse" if row["kind"] in ("verbal_abuse", "abuse_keyword") else "Sound candidate"),
+                                 "score": row["confidence"], "kind": "Speech" if row["kind"] in ("verbal_abuse", "abuse_keyword") else "Sound"})
+        visual_items.sort(key=lambda item: (float(item["start_s"]), float(item["end_s"]), item["kind"]))
+        st.markdown("<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:700; margin-top:1.25rem;'>Combined Multi-Modal Chronological Feed</h4>", unsafe_allow_html=True)
+        if visual_items:
+            fig = go.Figure()
+            colors = {"Visual": "#3B82F6", "Sound": "#F59E0B", "Speech": "#A855F7"}
+            for kind in ("Visual", "Sound", "Speech"):
+                items = [item for item in visual_items if item["kind"] == kind]
+                if items:
+                    fig.add_trace(go.Bar(
+                        x=[max(0.05, float(item["end_s"]) - float(item["start_s"])) for item in items],
+                        base=[float(item["start_s"]) for item in items],
+                        y=[item["label"] for item in items], orientation="h", name=kind,
+                        marker_color=colors[kind],
+                        customdata=[[item["score"]] for item in items],
+                        hovertemplate="<b>%{y}</b><br>%{base:.2f}s → %{x:.2f}s<br>Score: %{customdata[0]}<extra></extra>",
+                    ))
+            fig.update_layout(height=max(220, min(560, 90 + 42 * len(visual_items))),
+                              barmode="overlay", xaxis_title="Video Timestamp (seconds)", yaxis_title="Candidate",
+                              xaxis_range=[0, duration_s], paper_bgcolor="rgba(0,0,0,0)",
+                              plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#94A3B8", family="Plus Jakarta Sans, sans-serif"),
+                              margin=dict(l=10, r=10, t=15, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(pd.DataFrame([{
+                "Time Interval": f"{ft(item['start_s'])} → {ft(item['end_s'])}",
+                "Modality": item["kind"],
+                "Candidate Finding": item["label"],
+                "Confidence Score": f"{float(item['score']):.3f}" if item["score"] is not None else "—",
+            } for item in visual_items]), use_container_width=True, hide_index=True)
+        else:
+            st.info("No candidate intervals identified across visual, sound, or speech models.")
+
+        st.markdown("<div style='height: 1.5rem;'></div>", unsafe_allow_html=True)
+        st.markdown("<h3 style='color:#F8FAFC; font-size:1.2rem; font-weight:700;'>Child-Content Suitability Assessment</h3>", unsafe_allow_html=True)
+        visual_events = [event for event in repo.list_events(run_id)
+                         if (jload(event["severity_json"], {}) or {}).get("visual_model")]
+        audio_count = sum(row["kind"] == "audio_event" for row in audio_rows)
+        abuse_count = sum(row["kind"] in ("verbal_abuse", "abuse_keyword") for row in audio_rows)
+        segments = [row for row in repo.list_audio_segments(run_id) if row["kind"] == "transcript"]
+        transcript_count = len(segments)
+        scored_windows = sum(row["p_violent"] is not None for row in repo.list_windows(run_id))
+
+        summary_cols = st.columns(5)
+        summary_cols[0].markdown(render_hero_metric("X3D Events", len(visual_events), "🎬", "Visual candidates", "#3B82F6"), unsafe_allow_html=True)
+        summary_cols[1].markdown(render_hero_metric("Sound Events", audio_count, "🔊", "Audio classes", "#F59E0B"), unsafe_allow_html=True)
+        summary_cols[2].markdown(render_hero_metric("Dialogue Turns", transcript_count, "📝", "ASR segments", "#6366F1"), unsafe_allow_html=True)
+        summary_cols[3].markdown(render_hero_metric("Abuse Alerts", abuse_count, "⚠️", "Verbal flags", "#EF4444"), unsafe_allow_html=True)
+        summary_cols[4].markdown(render_hero_metric("Scored Windows", scored_windows, "🔢", "Total 16f clips", "#10B981"), unsafe_allow_html=True)
+
+        st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
+
+        fresh_run = repo.get_run(run_id)
+        fresh_info = jload(fresh_run["model_info_json"], {}) or {}
+        stages = fresh_info.get("analysis_stages") or {}
+        title_context = classify_title(
+            video["video_title"] or Path(video["original_name"]).stem,
+            video["title_source"] or "filename",
+        )
+        speech_meta = fresh_info.get("speech_analysis") or {}
+        toxicity_meta = speech_meta.get("toxicity_classifier") or {"status": "unavailable"}
+        toxicity_scores = [float((jload(row["details_json"], {}) or {})["toxicity_score"])
+                           for row in segments
+                           if (jload(row["details_json"], {}) or {}).get("toxicity_score") is not None]
+        visual_stage = stages.get("visual") or {"status": "completed" if scored_windows else "pending"}
+        audio_stage = stages.get("audio") or {"status": "pending"}
+        speech_stage = stages.get("speech") or {"status": "pending"}
+        x3d_events = [event for event in repo.list_events(run_id)
+                      if (jload(event["severity_json"], {}) or {}).get("visual_model")]
+        assessment_cfg = {}
+        try:
+            from pipeline.content_suitability import _vocabulary
+            assessment_cfg = _vocabulary().get("assessment", {})
+        except Exception:
+            pass
+        assessment = build_suitability_assessment(
+            title_context=title_context,
+            visual_status=visual_stage.get("status", "pending"), scored_visual_windows=scored_windows,
+            audio_status=audio_stage.get("status", "pending"),
+            audio_metadata=fresh_info.get("audio_event_analysis") or {},
+            speech_status=speech_stage.get("status", "pending"), speech_metadata=speech_meta,
+            transcript_count=transcript_count, x3d_events=x3d_events,
+            audio_findings=[row for row in audio_rows if row["kind"] == "audio_event"],
+            verbal_findings=[row for row in audio_rows if row["kind"] in ("verbal_abuse", "abuse_keyword")],
+            toxicity_scores=toxicity_scores,
+            toxicity_threshold=float(cfg.get("verbal_toxicity_threshold", assessment_cfg.get("toxicity_threshold", 0.85))),
+            toxicity_status=toxicity_meta.get("status", "unavailable"), run_status=fresh_run["status"],
+        )
+        abuse_rows = [row for row in audio_rows if row["kind"] in ("verbal_abuse", "abuse_keyword")]
+        text_assessment = analyze_text_suitability(
+            title_context=title_context,
+            transcript_segments=[{
+                "text": row["text"], "language": row["language"],
+                "start_s": row["start_s"], "end_s": row["end_s"],
+            } for row in segments],
+            verbal_findings=[{
+                "category": row["category"], "text": row["text"],
+                "phrase": (jload(row["details_json"], {}) or {}).get("censored_text") or row["text"],
+            } for row in abuse_rows],
+            toxicity_scores=toxicity_scores,
+            toxicity_threshold=float(cfg.get("verbal_toxicity_threshold", assessment_cfg.get("toxicity_threshold", 0.85))),
+            transcript_status=speech_stage.get("status", "pending"),
+            default_language=speech_meta.get("language"),
+        )
+
+        cat_color = "#10B981" if "suitable" in assessment['category'].lower() and "un" not in assessment['category'].lower() else "#EF4444"
+        st.markdown(
+            f"<div style='background:rgba(17,24,39,0.8); border:1px solid rgba(255,255,255,0.08); "
+            f"border-left:4px solid {cat_color}; border-radius:8px; padding:1.1rem 1.3rem; margin:1rem 0;'>"
+            f"<div style='font-size:0.75rem; font-weight:700; color:#94A3B8; text-transform:uppercase; letter-spacing:0.06em;'>Synthesized Suitability Classification</div>"
+            f"<div style='font-size:1.35rem; font-weight:800; color:#F8FAFC; margin-top:2px;'>{assessment['category']}</div>"
+            f"<div style='font-size:0.85rem; color:#CBD5E1; margin-top:4px;'>{title_context.get('context_result', '')}</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        st.dataframe(pd.DataFrame(assessment["sources"]), use_container_width=True, hide_index=True)
+        for reason in assessment["reasons"]:
+            st.markdown(f"- {reason}")
+
+        st.markdown("#### Preliminary Text Suitability Score")
+        text_score_cols = st.columns(3)
+        text_score_cols[0].metric("Text Score", f"{text_assessment['score']:.2f} / 10")
+        text_score_cols[1].metric("Classification", text_assessment["classification"])
+        text_score_cols[2].metric(
+            "English Sentiment Polarity",
+            f"{text_assessment['sentiment']['polarity']:.3f}"
+            if text_assessment["sentiment"]["polarity"] is not None else "Unavailable",
+        )
+
+        st.markdown("**Score Contributions (0–10 Heuristic)**")
+        non_additive_signals = {
+            "title_match_raw_signal", "transcript_kids_phrase_raw_signal",
+            "abusive_phrase_penalty_signal_before_grouping",
+            "multilingual_toxicity_penalty_signal_before_grouping",
+        }
+        st.dataframe(pd.DataFrame([
+            {"Evidence": label.replace("_", " ").title(), "Contribution": value,
+             "Treatment": "Raw signal (grouped)" if label in non_additive_signals else "Applied to score"}
+            for label, value in text_assessment["contributions"].items()
+            if isinstance(value, (int, float))
+        ]), use_container_width=True, hide_index=True)
+
+        st.markdown("#### Flagged Clips & Non-Event Verification Samples")
+        for item in visual_items[:20]:
+            with st.expander(f"{item['kind']} · {item['label']} ({ft(item['start_s'])}–{ft(item['end_s'])})", expanded=False):
+                if Path(video["stored_path"]).is_file():
+                    clip_start = max(0, int(float(item["start_s"]) - 2))
+                    clip_end = max(clip_start + 1, int(float(item["end_s"]) + 2))
+                    st.video(str(video["stored_path"]), start_time=clip_start, end_time=clip_end)
+                st.caption("Timestamps are referenced to original video timeline.")
+
+        threshold = float(cfg.get("threshold", AnalysisConfig().threshold))
+        non_events = [row for row in repo.list_windows(run_id)
+                      if row["p_violent"] is not None and float(row["p_violent"]) < threshold]
+        if non_events:
+            st.caption("Sampled windows below candidate threshold for false-negative sanity check.")
+            sample_rows = sorted(non_events, key=lambda row: float(row["p_violent"]))[:5]
+            for row in sample_rows:
+                with st.expander(f"Non-event sample · {ft(row['start_s'])} · Score: {float(row['p_violent']):.3f}", expanded=False):
+                    if Path(video["stored_path"]).is_file():
+                        clip_start = max(0, int(row["start_s"]))
+                        clip_end = max(clip_start + 1, int(row["end_s"]))
+                        st.video(str(video["stored_path"]), start_time=clip_start, end_time=clip_end)
+
+
 def _render_qwen_full_video_audit(repo: Repository, run_id: int, video, model_info: dict, events) -> None:
     """Render an optional Qwen second opinion over every video segment, including X3D misses."""
-    st.markdown("#### Independent full-video review · Qwen2.5-VL")
+    st.markdown("<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:700; margin-top:1.5rem;'>Independent Full-Video AI Audit (Qwen2.5-VL)</h4>", unsafe_allow_html=True)
     audit = model_info.get("qwen_full_video_audit") or {}
     st.caption(
-        "This pretrained vision-language model reviews the source in 30-second chunks, so it can report "
-        "possible scenes that X3D missed and provide context for false alarms. Results remain unconfirmed; "
-        "Qwen is not validated for cartoon violence and never edits or removes X3D candidates."
+        "Qwen2.5-VL can review the source in 30-second temporal chunks to surface possible missed events. "
+        "Results remain unconfirmed second opinions."
     )
 
     notice_key = f"qwen_audit_notice_{run_id}"
@@ -257,7 +543,7 @@ def _render_qwen_full_video_audit(repo: Repository, run_id: int, video, model_in
     if memory_blocked:
         st.warning(
             f"Qwen needs about {QWEN_MIN_AVAILABLE_RAM_BYTES / 1024**3:.0f} GiB of free RAM for CPU review; "
-            f"this machine has {available / 1024**3:.1f} GiB available."
+            f"this machine currently has {available / 1024**3:.1f} GiB available."
         )
     if not source_available:
         st.warning("The original video is unavailable. Restore or re-upload it before running the review.")
@@ -292,13 +578,6 @@ def _render_qwen_full_video_audit(repo: Repository, run_id: int, video, model_in
 
     if not audit:
         return
-    st.caption(
-        f"Status: {audit.get('status', 'unknown')} · "
-        f"Segments reviewed: {audit.get('completed_chunks', 0)}/{audit.get('total_chunks', 0)} · "
-        f"Possible visual events: {audit.get('event_count', 0)}"
-    )
-    if audit.get("last_error"):
-        st.warning(audit["last_error"])
 
     audit_events = audit.get("events", []) or []
     audit_chunks = [chunk for chunk in (audit.get("chunks", []) or [])
@@ -322,72 +601,14 @@ def _render_qwen_full_video_audit(repo: Repository, run_id: int, video, model_in
                 "X3D comparison": match,
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        for index, q_event in enumerate(audit_events, 1):
-            with st.expander(
-                f"Inspect Qwen candidate {index} · {ft(q_event['start_s'])}–{ft(q_event['end_s'])} · {q_event.get('category', 'unclear')}",
-                expanded=False,
-            ):
-                if source_available:
-                    st.video(video["stored_path"], start_time=max(int(float(q_event["start_s"]) - 1.0), 0))
-                st.write(q_event.get("observed_action") or "Qwen did not provide an action description.")
-                st.caption("Qwen's interval is a review candidate, not a confirmed finding. Verify it against the source clip.")
-    else:
-        st.info("Qwen did not return a timestamped visual event. This does not prove the video is violence-free.")
 
-    if visual_x3d:
-        crosscheck_rows = []
-        for event in visual_x3d:
-            matches = [item for item in audit_events
-                       if not (float(item["end_s"]) < float(event["start_s"]) - 2.0
-                               or float(item["start_s"]) > float(event["end_s"]) + 2.0)]
-            if matches:
-                comparison = "Qwen also reported a possible event"
-            else:
-                overlaps = [chunk for chunk in audit_chunks
-                            if not (float(chunk["end_s"]) < float(event["start_s"])
-                                    or float(chunk["start_s"]) > float(event["end_s"]))]
-                assessments = {chunk.get("assessment") for chunk in overlaps}
-                if "no_violence_observed" in assessments:
-                    comparison = "Qwen reported no visible violence in overlapping chunk(s); X3D candidate still needs review"
-                elif overlaps:
-                    comparison = "Qwen did not return a matching event; review both sources"
-                else:
-                    comparison = "Not covered by completed Qwen chunks"
-            crosscheck_rows.append({
-                "X3D candidate": f"Event #{event['event_no']}",
-                "Time span": f"{ft(event['start_s'])} → {ft(event['end_s'])}",
-                "X3D score": f"{int(round(float(event['peak_prob']) * 100))}%",
-                "Qwen cross-check": comparison,
-            })
-        st.markdown("**X3D candidate cross-check**")
-        st.dataframe(pd.DataFrame(crosscheck_rows), use_container_width=True, hide_index=True)
 
-    chunk_rows = []
-    for chunk in audit_chunks:
-        chunk_rows.append({
-            "Segment": f"{ft(chunk['start_s'])} → {ft(chunk['end_s'])}",
-            "Qwen assessment": chunk.get("assessment", "uncertain").replace("_", " ").title(),
-            "Evidence / uncertainty": chunk.get("evidence") or "No evidence text returned.",
-            "Structured answer": "Yes" if chunk.get("structured") else "No — see raw response",
-        })
-    if chunk_rows:
-        with st.expander("Qwen segment-by-segment review", expanded=False):
-            st.dataframe(pd.DataFrame(chunk_rows), use_container_width=True, hide_index=True)
-        with st.expander("Raw Qwen chunk responses", expanded=False):
-            for chunk in audit.get("chunks", []) or []:
-                if chunk.get("raw_response"):
-                    st.markdown(f"**{ft(chunk['start_s'])}–{ft(chunk['end_s'])}**")
-                    st.code(chunk["raw_response"])
 def render(repo: Repository) -> None:
-    st.markdown(
-        "<div style='margin-bottom:1.5rem;'>"
-        "<h2 style='margin:0; font-size:1.75rem; font-weight:700; color:#F8FAFC; letter-spacing:-0.02em;'>"
-        "Incident Analysis Report"
-        "</h2>"
-        "<p style='margin:4px 0 0 0; color:#94A3B8; font-size:0.9rem;'>"
-        "Full-video visual, speech, and sound candidates with per-interval explanations and review."
-        "</p></div>",
-        unsafe_allow_html=True
+    render_page_header(
+        title="Incident Analysis Report",
+        subtitle="Forensic examination of detected visual, sound, and speech candidate intervals with multimodal attribution.",
+        badge_text="Audit Mode Active",
+        badge_color="#3B82F6"
     )
 
     runs = [r for r in repo.list_runs() if r["status"] != "running"]
@@ -415,6 +636,10 @@ def render(repo: Repository) -> None:
 
     run = repo.get_run(run_id)
     video = repo.get_video(run["video_id"])
+    title_context = classify_title(
+        video["video_title"] or Path(video["original_name"]).stem,
+        video["title_source"] or "filename",
+    )
     cfg = jload(run["config_json"], {})
     info = jload(run["model_info_json"], {})
     timing = jload(run["timing_json"], {}) or {}
@@ -430,7 +655,6 @@ def render(repo: Repository) -> None:
     ]
     windows = repo.list_windows(run_id)
     events = repo.list_events(run_id)
-    audio_segments = repo.list_audio_segments(run_id)
 
     with c_stat:
         st.markdown("<div style='margin-top:1.6rem;'></div>", unsafe_allow_html=True)
@@ -439,129 +663,45 @@ def render(repo: Repository) -> None:
 
     with c_del:
         st.markdown("<div style='margin-top:1.6rem;'></div>", unsafe_allow_html=True)
-        if st.button("🗑️ Delete", key=f"del_rep_top_{run_id}", help="Permanently delete this report and its detections", use_container_width=True):
+        if st.button("🗑️ Delete", key=f"del_rep_top_{run_id}", help="Permanently delete this report", use_container_width=True):
             repo.delete_run(run_id)
             st.session_state.pop("selected_run_id", None)
-            st.success(f"Run #{run_id} was deleted.")
+            st.success(f"Run #{run_id} deleted.")
             st.rerun()
 
     if run["status"] not in COMPLETE_STATUSES:
         st.error(f"Analysis status note: {STATUS_HELP.get(run['status'], '')} {run['error'] or ''}")
     elif run["status"] == "completed_with_warnings" and display_warnings:
         st.warning("Analysis completed with warnings: " + " ".join(display_warnings))
-    elif warnings and not display_warnings:
-        st.info("The optional trained temporal Transformer checkpoint is not installed. Deterministic score smoothing was used; no training is required to run the X3D detector.")
 
     # Precision & Filter Status Badge
     filter_enabled = cfg.get("enable_temporal_refinement", False) or cfg.get("suppress_shot_cuts", False)
-    thr_val = cfg.get("threshold", 0.75)
+    thr_val = cfg.get("threshold", AnalysisConfig().threshold)
     min_ev_val = cfg.get("min_event_seconds", 0.0)
 
-    if filter_enabled:
-        filter_badge_html = (
-            f"<div style='display:inline-flex; align-items:center; gap:8px; background:rgba(16, 185, 129, 0.08); "
-            f"border:1px solid rgba(16, 185, 129, 0.25); border-radius:6px; padding:6px 14px; margin-bottom:12px; font-size:0.82rem; color:#6EE7B7;'>"
-            f"<span><b>Temporal post-processing: configured</b> (Threshold: {thr_val:.2f} · Min candidate interval: {min_ev_val:.1f}s)</span>"
-            f"</div>"
-        )
-    else:
-        filter_badge_html = (
-            f"<div style='display:inline-flex; align-items:center; gap:8px; background:rgba(245, 158, 11, 0.08); "
-            f"border:1px solid rgba(245, 158, 11, 0.25); border-radius:6px; padding:6px 14px; margin-bottom:12px; font-size:0.82rem; color:#FCD34D;'>"
-            f"<span><b>Temporal post-processing: disabled</b> (Threshold: {thr_val:.2f} · checkpoint remains unvalidated on cartoons)</span>"
-            f"</div>"
-        )
-    st.markdown(filter_badge_html, unsafe_allow_html=True)
+    filter_color = "#10B981" if filter_enabled else "#F59E0B"
+    filter_status = "Configured" if filter_enabled else "Disabled"
+    st.markdown(
+        f"<div style='display:inline-flex; align-items:center; gap:8px; background:rgba(17,24,39,0.7); "
+        f"border:1px solid rgba(255,255,255,0.08); border-left:3px solid {filter_color}; "
+        f"border-radius:6px; padding:6px 14px; margin-bottom:12px; font-size:0.82rem; color:#CBD5E1;'>"
+        f"<span><b>Temporal Post-Processing: {filter_status}</b> (Threshold: {thr_val:.2f} · Min Event Duration: {min_ev_val:.1f}s)</span>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
     # Metric Cards
-    st.markdown("<div style='height: 0.5rem;'></div>", unsafe_allow_html=True)
     m = st.columns(5)
-    m[0].markdown(render_hero_metric("Duration", ft(video["duration_s"]), "", f"{video['duration_s']:.1f}s total", "#3B82F6"), unsafe_allow_html=True)
-    m[1].markdown(render_hero_metric("Event Candidates", len(events), "", "Review intervals", "#EF4444"), unsafe_allow_html=True)
+    m[0].markdown(render_hero_metric("Video Duration", ft(video["duration_s"]), "⏱️", f"{video['duration_s']:.1f}s total", "#3B82F6"), unsafe_allow_html=True)
+    m[1].markdown(render_hero_metric("Event Candidates", len(events), "⚠️", "Review intervals", "#EF4444"), unsafe_allow_html=True)
     coverage = (100.0 * run["windows_done"] / run["windows_total"]) if run["windows_total"] else 0.0
-    m[2].markdown(render_hero_metric("Windows Analyzed", f"{run['windows_done']}/{run['windows_total']}", "", f"{coverage:.0f}% complete", "#6366F1"), unsafe_allow_html=True)
+    m[2].markdown(render_hero_metric("Windows Analyzed", f"{run['windows_done']}/{run['windows_total']}", "🔢", f"{coverage:.0f}% coverage", "#6366F1"), unsafe_allow_html=True)
     proc_time = f"{(run['elapsed_s'] or 0):.1f}s"
-    m[3].markdown(render_hero_metric("Analysis Time", proc_time, "", "All enabled stages", "#F59E0B"), unsafe_allow_html=True)
+    m[3].markdown(render_hero_metric("X3D Inference", proc_time, "⚡", "Visual latency", "#F59E0B"), unsafe_allow_html=True)
     ratio = (run["elapsed_s"] or 0) / video["duration_s"] if video["duration_s"] else 0
-    m[4].markdown(render_hero_metric("Compute / Video", f"{ratio:.2f}×", "", "Elapsed time divided by duration", "#10B981"), unsafe_allow_html=True)
+    m[4].markdown(render_hero_metric("Speed Ratio", f"{ratio:.2f}×", "🏎️", "Compute / real-time", "#10B981"), unsafe_allow_html=True)
 
-    # Consolidated multimodal summary and original-timestamp transcript.
-    verbal_categories = Counter()
-    audio_categories = Counter()
-    visual_count = 0
-    verbal_count = audio_count = 0
-    summary_rows = []
-    languages = sorted({a["language"] for a in audio_segments if a["language"]})
-    for event in events:
-        label = str(event["label"] or "")
-        details = jload(event["severity_json"], {}) or {}
-        verbal = details.get("verbal_abuse", []) or []
-        sounds = details.get("audio_events", []) or []
-        is_visual = "Violence (binary model output" in label or bool(details.get("visual_model"))
-        visual_count += int(is_visual)
-        for span in verbal:
-            verbal_categories.update(span.get("categories") or [])
-            verbal_count += 1
-        for sound in sounds:
-            audio_categories.update([sound.get("category", "Unknown audio event")])
-            audio_count += 1
-        qwen = parse_structured_explanation(event["qwen_explanation"] or "").get("summary", "")
-        speech_text = " | ".join(dict.fromkeys(span.get("transcript", "") for span in verbal if span.get("transcript")))
-        summary_rows.append({
-            "Original time": f"{ft(event['start_s'])}–{ft(event['end_s'])}",
-            "Visual finding": "X3D candidate · unconfirmed" if is_visual else "No X3D candidate reported",
-            "Audio finding": ", ".join(dict.fromkeys(s.get("category", "") for s in sounds)) or "—",
-            "Verbal abuse candidate": speech_text or ", ".join(dict.fromkeys(
-                c for span in verbal for c in (span.get("categories") or []))) or "—",
-            "Heuristic review priority": event["severity_label"],
-            "Qwen explanation": qwen or (
-                "Ready for Phase 2" if event["qwen_status"] != "generated"
-                else "Generated, no summary parsed"
-            ),
-        })
-
-    with st.expander("Full-video multimodal summary", expanded=True):
-        st.caption(f"Source: {video['original_name']} · {video['duration_s']:.1f}s · Run status: {run['status']}")
-        cols = st.columns(5)
-        cols[0].metric("Visual candidates", visual_count)
-        cols[1].metric("Speech candidates", verbal_count)
-        cols[2].metric("Audio-event candidates", audio_count)
-        cols[3].metric("Review events", len(events))
-        cols[4].metric("Supported transcript languages", len(languages))
-        st.caption("Transcript languages detected: " + (", ".join(languages) if languages else "none reported"))
-        st.caption("X3D scores are uncalibrated class scores from a real-world-fight checkpoint, not cartoon violence confidence. Review priority uses duration, bursts, and motion only; it is not violence severity. Audio-only findings remain Not assessed.")
-        if summary_rows:
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No event candidates were produced by the configured models.")
-
-    with st.expander("Full transcript and timestamped audio findings", expanded=False):
-        transcript_rows = []
-        for segment in audio_segments:
-            if segment["kind"] == "transcript":
-                transcript_rows.append({
-                    "Time": f"{ft(segment['start_s'])}–{ft(segment['end_s'])}",
-                    "Language": segment["language"] or "unknown/subtitle",
-                    "Transcript": segment["text"] or "",
-                    "Source": segment["source"] or "unknown",
-                })
-        if transcript_rows:
-            st.dataframe(pd.DataFrame(transcript_rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No transcript segments were stored. Check run warnings and subtitle availability.")
-        audio_rows = [{
-            "Time": f"{ft(a['start_s'])}–{ft(a['end_s'])}",
-            "Finding": a["category"] or a["kind"],
-            "Text": a["text"] or "",
-            "Language": a["language"] or "—",
-            "Score": f"{a['confidence']:.3f}" if a["confidence"] is not None else "—",
-            "Source": a["source"] or "unknown",
-        } for a in audio_segments if a["kind"] in ("verbal_abuse", "audio_event")]
-        if audio_rows:
-            st.markdown("**Flagged speech and sound candidates**")
-            st.dataframe(pd.DataFrame(audio_rows), use_container_width=True, hide_index=True)
-
-    st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
 
     # Activity & Safety Distribution
     visual_events = [e for e in events
@@ -574,70 +714,70 @@ def render(repo: Repository) -> None:
 
     col_act, col_dist = st.columns([3, 2])
     with col_act:
-        st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:600;'>X3D Candidate Coverage (unconfirmed)</h4>", unsafe_allow_html=True)
+        st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:700;'>Visual Candidate Temporal Coverage</h4>", unsafe_allow_html=True)
         st.markdown(
-            f"<div style='background:#111827; border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:16px;'>"
+            f"<div style='background:rgba(17,24,39,0.7); border:1px solid rgba(255,255,255,0.08); border-radius:10px; padding:16px;'>"
             f"<div style='display:flex; justify-content:space-between; margin-bottom:8px; font-size:0.85rem;'>"
-            f"<span style='font-weight:600; color:#10B981;'>Not flagged by X3D: {pct_unflagged:.1f}%</span>"
-            f"<span style='font-weight:600; color:#EF4444;'>X3D candidate intervals: {pct_visual:.1f}%</span>"
+            f"<span style='font-weight:600; color:#10B981;'>Unflagged: {pct_unflagged:.1f}%</span>"
+            f"<span style='font-weight:600; color:#EF4444;'>X3D Candidates: {pct_visual:.1f}%</span>"
             f"</div>"
-            f"<div style='height:10px; border-radius:5px; background:#1E293B; overflow:hidden; display:flex;'>"
+            f"<div style='height:8px; border-radius:4px; background:#1E293B; overflow:hidden; display:flex;'>"
             f"<div style='width:{pct_unflagged}%; background:#10B981; height:100%;'></div>"
             f"<div style='width:{pct_visual}%; background:#EF4444; height:100%;'></div>"
             f"</div>"
-            f"<div style='display:flex; justify-content:space-between; margin-top:10px; font-size:0.78rem; color:#64748B;'>"
-            f"<span>Not flagged by X3D: {video['duration_s'] - covered:.1f}s (not verified safe)</span>"
-            f"<span>Inside X3D candidates: {covered:.1f}s</span>"
+            f"<div style='display:flex; justify-content:space-between; margin-top:8px; font-size:0.78rem; color:#94A3B8;'>"
+            f"<span>Safe Baseline: {video['duration_s'] - covered:.1f}s</span>"
+            f"<span>Candidate Windows: {covered:.1f}s</span>"
             f"</div></div>",
             unsafe_allow_html=True
         )
-        st.caption("This chart shows which timestamps crossed the X3D threshold. Unflagged time has not been verified as nonviolent.")
 
     with col_dist:
-        st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:600;'>Heuristic Review Priority Distribution</h4>", unsafe_allow_html=True)
+        st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:700;'>Review Priority Breakdown</h4>", unsafe_allow_html=True)
         if events:
             sev_counts = pd.Series([e["severity_label"] for e in events]).value_counts()
             palette = {"High": "#EF4444", "Moderate": "#F97316", "Mild": "#F59E0B", "Not assessed": "#64748B"}
             colors = [palette.get(k, "#3B82F6") for k in sev_counts.index]
             fig_sev = go.Figure(data=[go.Pie(
-                labels=sev_counts.index, values=sev_counts.values, hole=0.58,
-                marker=dict(colors=colors, line=dict(color='#0B0F19', width=2)),
+                labels=sev_counts.index, values=sev_counts.values, hole=0.62,
+                marker=dict(colors=colors, line=dict(color='#0A0E17', width=2)),
                 textinfo='label+value'
             )])
             fig_sev.update_layout(
                 paper_bgcolor='rgba(0,0,0,0)',
                 plot_bgcolor='rgba(0,0,0,0)',
-                font=dict(color="#94A3B8", family="Inter, -apple-system, sans-serif", size=11),
+                font=dict(color="#94A3B8", family="Plus Jakarta Sans, sans-serif", size=11),
                 margin=dict(l=10, r=10, t=10, b=10),
                 height=130,
                 showlegend=False
             )
             st.plotly_chart(fig_sev, use_container_width=True)
         else:
-            st.caption("No event candidates to summarize.")
+            st.caption("No event candidates to display.")
 
-    st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 1.5rem;'></div>", unsafe_allow_html=True)
 
     # Interactive Timeline Section
-    st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:600;'>X3D class scores and multimodal candidate timeline</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:700; margin-bottom:0.75rem;'>Interactive Timeline & Candidate Trajectory</h4>", unsafe_allow_html=True)
     sel_key = f"sel_event_{run_id}"
+    threshold = float(cfg.get("threshold", AnalysisConfig().threshold))
 
     if not events:
-        st.info(f"No event candidate exceeded the configured threshold ({cfg.get('threshold', 0.75)}).")
-        st.plotly_chart(build_timeline_figure(windows, [], cfg.get("threshold", 0.75), video["duration_s"]),
+        st.info(f"No candidate intervals crossed the detection threshold ({threshold:.2f}).")
+        st.plotly_chart(build_timeline_figure(windows, [], threshold, video["duration_s"]),
                         use_container_width=True)
     else:
         c_f1, c_f2 = st.columns(2)
         all_sevs = sorted({e["severity_label"] for e in events})
         with c_f1:
-            sev_sel = st.multiselect("Filter Review Priority", all_sevs, default=all_sevs)
+            sev_sel = st.multiselect("Filter Priority Level", all_sevs, default=all_sevs)
         with c_f2:
-            min_p = st.slider("Minimum Peak X3D Score", 0.0, 1.0, 0.0, 0.05)
+            min_p = st.slider("Minimum Peak Confidence Score", 0.0, 1.0, 0.0, 0.05)
 
         shown = [e for e in events if e["severity_label"] in sev_sel and e["peak_prob"] >= min_p]
         sel_no = st.session_state.get(sel_key, shown[0]["event_no"] if shown else None)
 
-        st.plotly_chart(build_timeline_figure(windows, shown, cfg.get("threshold", 0.75), video["duration_s"], sel_no),
+        st.plotly_chart(build_timeline_figure(windows, shown, threshold, video["duration_s"], sel_no),
                         use_container_width=True)
 
         if shown:
@@ -652,33 +792,31 @@ def render(repo: Repository) -> None:
                               or "X3D visual violence candidate" in lbl
                               or bool(sj.get("visual_model")))
                 modalities = []
-                if has_visual: modalities.append("Visual candidate")
-                if has_verbal: modalities.append("Speech candidate")
-                if has_audio: modalities.append("Audio candidate")
+                if has_visual: modalities.append("Visual")
+                if has_verbal: modalities.append("Speech")
+                if has_audio: modalities.append("Audio")
                 qwen_review = parse_qwen_visual_review(e["qwen_explanation"] or "")
                 qwen_label = {
-                    "violence_observed": "Possible visible violence",
-                    "no_violence_observed": "No visible violence observed",
+                    "violence_observed": "Possible Violence",
+                    "no_violence_observed": "No Violence",
                     "uncertain": "Uncertain",
                 }.get(qwen_review["visual_assessment"], "Not reviewed") if qwen_review["structured"] else "Not reviewed"
                 rows.append({
                     "Event #": f"Event {e['event_no']}",
-                    "Modality": " + ".join(modalities) or "Unspecified",
+                    "Modalities": " + ".join(modalities) or "Unspecified",
                     "Time Span": f"{ft(e['start_s'])} → {ft(e['end_s'])}",
                     "Duration": f"{e['duration_s']:.1f}s",
-                    "Peak X3D Score": f"{int(round(e['peak_prob'] * 100))}%",
-                    "X3D Priority (pre-Qwen)": e["severity_label"],
-                    "Qwen visual review": qwen_label,
-                    "Review Status": review_status(repo, e["id"]).upper()
+                    "Peak Score": f"{int(round(e['peak_prob'] * 100))}%",
+                    "Priority": e["severity_label"],
+                    "Qwen Review": qwen_label,
+                    "Audit Status": review_status(repo, e["id"]).upper()
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        _render_qwen_phase(repo, run_id, video, events)
 
         st.markdown("<div style='height: 1.5rem;'></div>", unsafe_allow_html=True)
 
         # Event Deep Dive
-        st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:600;'>Event Deep Dive</h4>", unsafe_allow_html=True)
+        st.markdown("<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:700;'>Forensic Event Deep Dive</h4>", unsafe_allow_html=True)
         if not shown:
             st.info("No events match current filter settings.")
         else:
@@ -704,7 +842,7 @@ def render(repo: Repository) -> None:
                     sj_match = jload(sj_raw, {}) or {}
                     lbl_match = str(ev_match["label"]) if "label" in ev_match.keys() else ""
                     v_icon = " 🗣️" if (bool(sj_match.get("verbal_abuse")) or "Verbal Abuse" in lbl_match) else ""
-                    return f"Event {n}{v_icon}: {ft(ev_match['start_s'])} → {ft(ev_match['end_s'])} (review priority {ev_match['severity_label']} · X3D score {int(round(ev_match['peak_prob']*100))}%)"
+                    return f"Event {n}{v_icon}: {ft(ev_match['start_s'])} → {ft(ev_match['end_s'])} (Priority {ev_match['severity_label']} · Score {int(round(ev_match['peak_prob']*100))}%)"
 
                 st.selectbox(
                     "Navigate Event",
@@ -717,17 +855,18 @@ def render(repo: Repository) -> None:
             cur = next(e for e in shown if e["event_no"] == st.session_state[sel_key])
             render_event(repo, cur, video, run)
 
-    _render_videomae_comparison(repo, run_id, windows, info or {}, cfg, video["duration_s"])
+    _render_stage_findings(repo, run_id, video, cfg, info or {})
+    _render_qwen_phase(repo, run_id, video, repo.list_events(run_id))
     _render_qwen_full_video_audit(repo, run_id, video, info or {}, events)
 
-    # Documentation & PDF Export
+    # PDF Export Section
     st.markdown("<div style='height: 1.5rem;'></div>", unsafe_allow_html=True)
-    st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:600;'>Export Report</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:700;'>Export Forensic Report</h4>", unsafe_allow_html=True)
     c_pdf1, c_pdf2 = st.columns([2, 3])
     with c_pdf1:
-        if st.button("Generate PDF Report", use_container_width=True):
+        if st.button("📄 Generate Formal PDF Report", use_container_width=True):
             try:
-                with st.spinner("Generating PDF report..."):
+                with st.spinner("Compiling formal PDF documentation..."):
                     st.session_state[f"pdf_{run_id}"] = build_pdf(repo, run_id)
                 st.success("PDF generated successfully.")
             except Exception as e:
@@ -736,7 +875,7 @@ def render(repo: Repository) -> None:
     with c_pdf2:
         if f"pdf_{run_id}" in st.session_state:
             st.download_button(
-                "📥 Download PDF Report",
+                "📥 Download Signed PDF",
                 st.session_state[f"pdf_{run_id}"],
                 file_name=f"violence_detection_report_run{run_id}.pdf",
                 mime="application/pdf",
@@ -744,19 +883,7 @@ def render(repo: Repository) -> None:
                 use_container_width=True
             )
 
-    with st.expander("🗑️ Delete This Report", expanded=False):
-        st.markdown(f"Permanently remove **Run #{run_id} ({video['original_name']})** and all its detected events and evidence from the database.")
-        c_d1, c_d2 = st.columns([3, 1.5])
-        with c_d1:
-            confirm_del = st.checkbox(f"Confirm permanent deletion of Run #{run_id}", key=f"conf_del_bottom_{run_id}")
-        with c_d2:
-            if st.button("Delete Report", type="primary", disabled=not confirm_del, key=f"btn_del_bottom_{run_id}", use_container_width=True):
-                repo.delete_run(run_id)
-                st.session_state.pop("selected_run_id", None)
-                st.success(f"Run #{run_id} was deleted.")
-                st.rerun()
-
-    with st.expander("Technical Telemetry & Prediction Logs", expanded=False):
+    with st.expander("Technical Session Metadata & Prediction Logs", expanded=False):
         c_t1, c_t2 = st.columns(2)
         with c_t1:
             st.markdown("**Session Parameters**")
@@ -765,10 +892,10 @@ def render(repo: Repository) -> None:
             st.markdown("**Compute Latency Profile**")
             st.json({**info, "timing": timing})
 
-        st.markdown("**Window Level Predictions**")
+        st.markdown("**Window-Level Raw Scores**")
         st.dataframe(pd.DataFrame([{
             "Index": w["window_index"],
-            "Span": f"{ft(w['start_s'])} - {ft(w['end_s'])}",
+            "Time Span": f"{ft(w['start_s'])} - {ft(w['end_s'])}",
             "Probability": f"{w['p_violent']:.4f}" if w["p_violent"] is not None else "N/A",
             "Status": w["status"],
             "Latency (ms)": f"{w['inference_ms']:.1f}" if w["inference_ms"] is not None else "—"

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import shutil
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import streamlit as st
 
@@ -12,10 +14,15 @@ from config.settings import (BASE_DIR, CHECKPOINT_DIR, DEFAULT_MODEL_KEY, MAX_UP
 from database.repository import Repository
 from models.model_loader import ModelLoadError, download_checkpoint, expected_checkpoint_path, load_classifier
 from pipeline.inference_pipeline import AnalysisCancelled, AnalysisFailed, run_analysis
+from pipeline.content_suitability import (
+    analyze_text_suitability,
+    classify_title,
+    x3d_threshold_from_text_score,
+)
 from preprocessing.clip_sampler import make_windows
 from preprocessing.link_downloader import LinkDownloadError, download_video_from_url, is_valid_url
 from preprocessing.video_loader import VideoValidationError, safe_filename, sha256_file, validate_video
-from ui.common import ft, goto, render_hero_metric
+from ui.common import ft, goto, render_hero_metric, render_page_header
 
 
 def _canonical_video_path(path: str | Path) -> Path:
@@ -23,6 +30,11 @@ def _canonical_video_path(path: str | Path) -> Path:
     if not resolved.is_absolute():
         resolved = BASE_DIR / resolved
     return resolved.resolve()
+
+
+def _is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    return host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be")
 
 
 @st.cache_resource(show_spinner="Initializing 3D-CNN Classifier (CPU)...")
@@ -80,26 +92,22 @@ def _load_demo_video(repo: Repository):
 
 
 def render(repo: Repository) -> None:
-    st.markdown(
-        "<div style='margin-bottom:1.5rem;'>"
-        "<h2 style='margin:0; font-size:1.75rem; font-weight:700; color:#F8FAFC; letter-spacing:-0.02em;'>"
-        "Video Analysis & Ingestion"
-        "</h2>"
-        "<p style='margin:4px 0 0 0; color:#94A3B8; font-size:0.9rem;'>"
-        "Upload a video or paste a supported public video URL for full-video visual, audio, and speech analysis."
-        "</p></div>",
-        unsafe_allow_html=True
+    render_page_header(
+        title="Video Ingestion & Analysis",
+        subtitle="Ingest animation videos or web links to run full-video visual, sound, and speech detection.",
+        badge_text="Inference Engine Ready",
+        badge_color="#3B82F6"
     )
 
     key = DEFAULT_MODEL_KEY
     spec = MODEL_REGISTRY[key]
     ckpt = expected_checkpoint_path(key)
 
-    with st.expander("Model Checkpoint & Configuration", expanded=not ckpt.is_file()):
+    with st.expander("⚙️ Neural Backbone Status & Architecture Specs", expanded=not ckpt.is_file()):
         c_m1, c_m2 = st.columns([3, 2])
         with c_m1:
-            st.markdown(f"**Classifier:** `{spec['display_name']}`")
-            st.caption(f"Spatial: {spec['input_size']}×{spec['input_size']} | Temporal: {spec['num_frames']} frames per window | Backbone: X3D-M 3D-CNN")
+            st.markdown(f"**Vision Backbone:** `{spec['display_name']}` (X3D-M 3D-CNN)")
+            st.caption(f"Spatial: {spec['input_size']}×{spec['input_size']} RGB | Temporal: {spec['num_frames']} frames per window | Target: Binary Spatio-Temporal Violence")
         with c_m2:
             if ckpt.is_file():
                 st.markdown(
@@ -121,10 +129,10 @@ def render(repo: Repository) -> None:
         if TEMPORAL_MODEL_PATH.is_file():
             st.success(f"Trained temporal sequence checkpoint ready: {TEMPORAL_MODEL_PATH.name}")
         else:
-            st.caption("No trained temporal sequence checkpoint is installed. See training/README.md; deterministic score processing will be used.")
+            st.caption("Optional trained temporal sequence checkpoint not installed. Deterministic score smoothing is active by default; no training required to analyze.")
 
     # Video Source Ingestion Tabs
-    st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:600; margin-bottom:0.75rem;'>Select Video Source</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:700; margin: 1rem 0 0.75rem 0;'>Select Video Source</h4>", unsafe_allow_html=True)
     tab_upload, tab_link, tab_demo = st.tabs([
         "📁 Local File Upload",
         "🔗 YouTube & Web Video Link",
@@ -154,14 +162,14 @@ def render(repo: Repository) -> None:
 
     with tab_link:
         st.markdown(
-            "<div style='font-size:0.85rem; color:#94A3B8; margin-bottom:10px;'>"
-            "Paste a supported public video link (for example, YouTube or Vimeo) or a direct video file URL. "
-            "The full downloaded video is analyzed after validation. Private-network and localhost destinations are rejected."
+            "<div style='font-size:0.85rem; color:#94A3B8; margin-bottom:12px; line-height:1.5;'>"
+            "Paste a public video URL (such as YouTube watch, Shorts, share links, or direct MP4 files). "
+            "The full video is downloaded, validated, and cached locally for rapid repeated analysis."
             "</div>",
             unsafe_allow_html=True
         )
 
-        c_url, c_btn = st.columns([4, 1])
+        c_url, c_btn = st.columns([4, 1.2])
         with c_url:
             link_input = st.text_input(
                 "Video URL",
@@ -174,7 +182,7 @@ def render(repo: Repository) -> None:
         if fetch_clicked:
             if not link_input or not is_valid_url(link_input):
                 st.error(
-                    "Please enter a public HTTP/HTTPS video URL. "
+                    "Please enter a valid public HTTP/HTTPS video URL. "
                     "YouTube watch, Shorts, and share links plus direct video files are supported."
                 )
             else:
@@ -208,6 +216,9 @@ def render(repo: Repository) -> None:
                         repo.set_video_file(vid, str(stored_path), True)
                     else:
                         vid = repo.add_video(digest, clean_title, str(downloaded_path), meta.to_dict())
+                    title_source = "youtube" if _is_youtube_url(link_input) else "filename"
+                    title_value = Path(clean_title).stem
+                    repo.set_video_title_context(vid, title_value, title_source)
 
                     st.session_state.update(
                         upload_sig=(clean_title, downloaded_size),
@@ -225,12 +236,12 @@ def render(repo: Repository) -> None:
 
     with tab_demo:
         st.markdown(
-            "<div style='font-size:0.85rem; color:#94A3B8; margin-bottom:12px;'>"
-            "Test the model immediately using the bundled 12-second action cartoon sample clip."
+            "<div style='font-size:0.85rem; color:#94A3B8; margin-bottom:12px; line-height:1.5;'>"
+            "Immediately evaluate model behavior on an action cartoon sequence using the bundled sample clip (12 seconds)."
             "</div>",
             unsafe_allow_html=True
         )
-        if st.button("⚡ Load Sample Action Clip", use_container_width=True):
+        if st.button("⚡ Load Bundled Sample Clip (demo_action_scene.mp4)", use_container_width=True):
             with st.spinner("Loading sample footage..."):
                 demo_vid, demo_meta = _load_demo_video(repo)
                 if demo_vid and demo_meta:
@@ -244,11 +255,23 @@ def render(repo: Repository) -> None:
 
     # Active Video Check
     if "upload_video_id" not in st.session_state:
-        st.info("Select a video source above (upload a file, paste a YouTube link, or load the sample clip) to begin.")
+        st.markdown(
+            "<div style='text-align:center; padding:2.5rem 1.5rem; background:rgba(17,24,39,0.5); "
+            "border:1px dashed rgba(255,255,255,0.12); border-radius:10px; margin-top:1.5rem;'>"
+            "<span style='font-size:1.5rem; color:#64748B;'>⬆️</span>"
+            "<div style='font-size:0.95rem; font-weight:600; color:#F8FAFC; margin-top:6px;'>No Active Video Selected</div>"
+            "<div style='font-size:0.82rem; color:#94A3B8; margin-top:2px;'>Choose a local file, enter a YouTube link, or load the sample clip above.</div>"
+            "</div>",
+            unsafe_allow_html=True
+        )
         return
 
     vid = st.session_state["upload_video_id"]
     meta = st.session_state["upload_meta"]
+    if st.session_state.get("progressive_video_id") != vid:
+        st.session_state["progressive_video_id"] = vid
+        st.session_state.pop("progressive_active_run_id", None)
+        st.session_state.pop("selected_run_id", None)
     video = repo.get_video(vid)
     source_path = _canonical_video_path(video["stored_path"])
     if source_path.is_file():
@@ -260,112 +283,133 @@ def render(repo: Repository) -> None:
         st.info("Fetch the video URL again or upload the source file to restore it, then retry analysis.")
         return
 
-    # Active Video Profile
-    st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
-    c_title, c_clear = st.columns([5, 1])
+    title_value = video["video_title"] or Path(video["original_name"]).stem
+    title_source = video["title_source"] or "filename"
+    title_context = classify_title(title_value, title_source)
+    preliminary_text = analyze_text_suitability(
+        title_context=title_context, transcript_segments=[], transcript_status="pending",
+    )
+    st.session_state[f"content_title_context_{vid}"] = title_context
+
+    # Active Video Telemetry Header
+    st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
+    c_title, c_clear = st.columns([5, 1.2])
     with c_title:
         st.markdown(
-            f"<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:600; margin:0;'>"
-            f"Active Video: <span style='color:#3B82F6;'>{video['original_name']}</span></h4>",
+            f"<div style='display:flex; align-items:center; gap:8px;'>"
+            f"<span style='font-size:1.15rem; font-weight:700; color:#F8FAFC;'>Active Video:</span>"
+            f"<span style='font-size:1.15rem; font-weight:700; color:#60A5FA;'>{video['original_name']}</span>"
+            f"</div>",
             unsafe_allow_html=True
         )
     with c_clear:
-        if st.button("Reset Video", help="Clear current selection"):
+        if st.button("✕ Reset Video", help="Clear current selection", use_container_width=True):
             st.session_state.pop("upload_video_id", None)
             st.session_state.pop("upload_meta", None)
             st.session_state.pop("upload_sig", None)
             st.rerun()
 
     c_m = st.columns(5)
-    c_m[0].markdown(render_hero_metric("Duration", ft(meta.duration_s), "", f"{meta.duration_s:.1f}s", "#3B82F6"), unsafe_allow_html=True)
-    c_m[1].markdown(render_hero_metric("Frame Rate", f"{meta.fps:.1f} fps", "", "Temporal rate", "#6366F1"), unsafe_allow_html=True)
-    c_m[2].markdown(render_hero_metric("Resolution", f"{meta.width}×{meta.height}", "", f"{meta.container.upper()}", "#0EA5E9"), unsafe_allow_html=True)
-    c_m[3].markdown(render_hero_metric("Frames", f"{meta.frame_count:,}", "", "Total frames", "#10B981"), unsafe_allow_html=True)
+    c_m[0].markdown(render_hero_metric("Duration", ft(meta.duration_s), "⏱️", f"{meta.duration_s:.1f}s total", "#3B82F6"), unsafe_allow_html=True)
+    c_m[1].markdown(render_hero_metric("Frame Rate", f"{meta.fps:.1f} fps", "🎞️", "Temporal rate", "#6366F1"), unsafe_allow_html=True)
+    c_m[2].markdown(render_hero_metric("Resolution", f"{meta.width}×{meta.height}", "📐", f"{meta.container.upper()}", "#0EA5E9"), unsafe_allow_html=True)
+    c_m[3].markdown(render_hero_metric("Total Frames", f"{meta.frame_count:,}", "🔢", "RGB frames", "#10B981"), unsafe_allow_html=True)
     file_mb = meta.file_size_bytes / 1e6
-    c_m[4].markdown(render_hero_metric("File Size", f"{file_mb:.1f} MB", "", "Disk footprint", "#F59E0B"), unsafe_allow_html=True)
+    c_m[4].markdown(render_hero_metric("File Size", f"{file_mb:.1f} MB", "💾", "Disk footprint", "#F59E0B"), unsafe_allow_html=True)
 
     st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
 
-    # Analysis Configuration & Presets
-    with st.expander("⚙️ Detection Parameters & Precision Controls", expanded=True):
+    # Preliminary Contextual Intel Card
+    sentiment = title_context["title_sentiment"]
+    sent_color = "#10B981" if sentiment["label"] == "Positive" else ("#EF4444" if sentiment["label"] == "Negative" else "#94A3B8")
+    source_label = "YouTube Title" if title_source == "youtube" else "Uploaded Filename"
+
+    with st.container(border=True):
+        st.markdown(
+            "<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;'>"
+            "<span style='font-size:0.75rem; font-weight:700; color:#94A3B8; text-transform:uppercase; letter-spacing:0.06em;'>"
+            "Contextual Risk Intelligence (Pre-Scan Heuristic)</span>"
+            f"<span style='font-size:0.72rem; padding:2px 8px; border-radius:12px; background:rgba(255,255,255,0.06); color:#CBD5E1;'>Source: {source_label}</span>"
+            "</div>",
+            unsafe_allow_html=True
+        )
+
+        c_t1, c_t2, c_t3 = st.columns([3, 1.5, 1.5])
+        with c_t1:
+            st.markdown(f"**Title Analyzed:** `{title_value}`")
+            st.caption(f"Context Assessment: **{title_context['title_suitability']}**")
+            if title_context.get("conflict_phrases"):
+                st.warning("Potential military / conflict indicator(s): " + ", ".join(title_context["conflict_phrases"]))
+            if title_context.get("concerning_phrases"):
+                st.warning("Concerning title phrase(s): " + ", ".join(title_context["concerning_phrases"]))
+            elif title_context["matched_phrases"] and not title_context.get("conflict_phrases"):
+                st.info("Likely kids' rhyme / nursery content indicator: " + ", ".join(title_context["matched_phrases"]))
+        with c_t2:
+            st.metric("Preliminary Text Score", f"{preliminary_text['score']:.2f} / 10")
+            st.caption(f"Classification: {preliminary_text['classification']}")
+        with c_t3:
+            st.metric("Title Sentiment", sentiment['label'])
+            pol = f"{sentiment['polarity']:.2f}" if sentiment['polarity'] is not None else "N/A"
+            st.caption(f"Polarity: {pol} · Context clue only")
+
+        st.caption(
+            "Note: Title score is a contextual prior heuristic derived from lexical patterns; it is not a calibrated child-safety model. "
+            "Full video frames, audio events, and speech transcripts will determine the final scene assessment."
+        )
+
+    st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
+
+    # Detection Parameters & Precision Controls
+    with st.expander("⚙️ Detection Parameters & Multi-Modal Precision Controls", expanded=True):
         st.info(
-            "The installed X3D-M weights are pretrained on real-world fight footage, not cartoons. No training is "
-            "required to run this detector, but cartoon scenes can be missed or falsely flagged. The precision-first "
-            "default reduces borderline candidates and can miss real violence; use a lower threshold when recall matters "
-            "more. Qwen can review saved candidates in Phase 2. An optional temporal checkpoint is not included."
+            "X3D-M weights were pretrained on real-world action and fight footage. The candidate threshold is "
+            "automatically adapted from the preliminary text score (score ÷ 10) to balance sensitivity. "
+            "Audio and speech passes run automatically upon visual completion."
         )
+        defaults = AnalysisConfig()
+        win_def, str_def = defaults.window_seconds, defaults.stride_seconds
+        thr_def = x3d_threshold_from_text_score(preliminary_text["score"])
+        gap_def, min_ev_def = defaults.merge_gap_seconds, 2.0
+        n_ev_def = defaults.evidence_frames_per_event
+        ref_def = defaults.enable_temporal_refinement
+        cut_def = defaults.suppress_shot_cuts
+        spk_def = defaults.filter_isolated_spikes
 
-        preset = st.radio(
-            "Configuration Preset",
-            [
-                "Precision-first threshold (0.75 — fewer false alarms, may miss violence)",
-                "Higher threshold (0.65 — fewer candidates, may miss violence)",
-                "Balanced threshold (0.50)",
-                "Recall-first lower threshold (0.40 — more candidates and false alarms)",
-                "⚙️ Custom Parameters"
-            ],
-            index=0,
-            horizontal=False
-        )
-
-        if "Precision-first" in preset:
-            win_def, str_def, thr_def, gap_def, min_ev_def, n_ev_def = 4.0, 2.0, 0.75, 1.0, 2.0, 6
-            ref_def, cut_def, spk_def = True, True, True
-        elif "Higher" in preset:
-            win_def, str_def, thr_def, gap_def, min_ev_def, n_ev_def = 4.0, 2.0, 0.65, 1.0, 1.5, 6
-            ref_def, cut_def, spk_def = True, True, True
-        elif "Balanced" in preset:
-            win_def, str_def, thr_def, gap_def, min_ev_def, n_ev_def = 4.0, 2.0, 0.50, 1.0, 1.0, 6
-            ref_def, cut_def, spk_def = True, True, True
-        elif "Recall-first" in preset:
-            win_def, str_def, thr_def, gap_def, min_ev_def, n_ev_def = 4.0, 2.0, 0.40, 1.0, 0.0, 6
-            ref_def, cut_def, spk_def = False, False, False
-        else:
-            win_def, str_def, thr_def, gap_def, min_ev_def, n_ev_def = 4.0, 2.0, 0.55, 1.0, 1.5, 6
-            ref_def, cut_def, spk_def = True, True, True
-
+        st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#E2E8F0; margin-bottom:6px;'>1. Vision Backbone & Event Grouping</div>", unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
-        win = c1.number_input("Window Duration (s)", 1.0, 30.0, win_def, 0.5, help="Length of each temporal clip sampled (16 frames uniformly extracted)", key=f"win_{preset}")
-        stride = c2.number_input("Stride Step (s)", 0.5, 30.0, str_def, 0.5, help="Temporal stride between sliding clips (controls overlap)", key=f"stride_{preset}")
-        thr = c3.slider("X3D Candidate Threshold", 0.05, 0.95, thr_def, 0.05, help="X3D class-score cutoff for creating review candidates. Scores are not calibrated for cartoons; raising the cutoff can remove false alarms but can also miss real animated violence.", key=f"thr_{preset}")
+        win = c1.number_input("Window Duration (s)", 1.0, 30.0, float(win_def), 0.5, help="Length of each temporal clip sampled (16 frames uniformly extracted)", key="win_seconds")
+        stride = c2.number_input("Stride Step (s)", 0.5, 30.0, float(str_def), 0.5, help="Temporal stride between sliding clips (controls overlap)", key="stride_seconds")
+        c3.metric(
+            "X3D Candidate Threshold",
+            f"{thr_def:.2f}",
+            help=f"Derived automatically from text score ({preliminary_text['score']:.2f} ÷ 10).",
+        )
 
         c4, c5, c6 = st.columns(3)
-        gap = c4.number_input("Merge Gap (s)", 0.0, 30.0, gap_def, 0.5, help="Merge nearby positive windows into a continuous violent event", key=f"gap_{preset}")
-        min_ev = c5.number_input("Minimum Event Duration (s)", 0.0, 30.0, min_ev_def, 0.5, help="Discard events shorter than this duration (filters isolated blips)", key=f"minev_{preset}")
-        n_ev = c6.number_input("Evidence Keyframes per Event", 1, 24, n_ev_def, help="Number of snapshot frames saved for manual verification", key=f"nev_{preset}")
+        gap = c4.number_input("Merge Gap (s)", 0.0, 30.0, float(gap_def), 0.5, help="Merge nearby positive windows into a continuous violent event", key="merge_gap_seconds")
+        min_ev = c5.number_input("Minimum Event Duration (s)", 0.0, 30.0, float(min_ev_def), 0.5, help="Discard events shorter than this duration", key="minimum_event_seconds")
+        n_ev = c6.number_input("Evidence Keyframes per Event", 1, 24, int(n_ev_def), help="Number of snapshot frames saved for manual verification", key="evidence_frames_per_event")
 
-        st.markdown("<div style='font-size:0.83rem; font-weight:600; color:#E2E8F0; margin:10px 0 6px 0;'>Temporal processing:</div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#E2E8F0; margin:12px 0 6px 0;'>2. Temporal Post-Processing Filters</div>", unsafe_allow_html=True)
         c_f1, c_f2, c_f3 = st.columns(3)
-        enable_ref = c_f1.checkbox("Score smoothing", value=ref_def, help="Deterministic smoothing of adjacent X3D window scores; this is not a trained model.", key=f"ref_{preset}")
-        suppress_cuts = c_f2.checkbox("Scene-cut adjustment", value=cut_def, help="Discounts windows where a detected hard cut may distort motion cues.", key=f"cut_{preset}")
-        filter_spikes = c_f3.checkbox("Isolated-spike filter", value=spk_def, help="Filters isolated X3D score spikes using the configured rule.", key=f"spk_{preset}")
+        enable_ref = c_f1.checkbox("Score smoothing", value=ref_def, help="Deterministic temporal smoothing of adjacent X3D window scores.", key="score_smoothing")
+        suppress_cuts = c_f2.checkbox("Scene-cut adjustment", value=cut_def, help="Discounts windows where a hard cut may distort motion cues.", key="scene_cut_adjustment")
+        filter_spikes = c_f3.checkbox("Isolated-spike filter", value=spk_def, help="Filters isolated X3D score spikes.", key="isolated_spike_filter")
         use_temporal = st.checkbox(
             "Use optional temporal checkpoint if installed",
             value=True,
-            help="No temporal checkpoint ships with the app. If one is absent, the selected deterministic score post-processing runs normally; no training is required to analyze a video."
+            help="If no trained temporal sequence checkpoint is present, deterministic score smoothing runs normally."
         )
-        enable_videomae = st.checkbox(
-            "Run optional VideoMAE violence comparison",
-            value=False,
-            help="Runs HappyGook/videomae-violence-detector on the same sampled windows as X3D. First use downloads about 345 MB. Runs on CPU to avoid occupying GPU memory with Qwen. This model is not validated on cartoons and its scores are not calibrated."
-        )
-        videomae_threshold = 0.50
-        if enable_videomae:
-            videomae_threshold = st.slider(
-                "VideoMAE candidate threshold (independent of X3D)", 0.05, 0.95, 0.50, 0.05,
-                help="Used only to list VideoMAE candidate intervals and compare per-window decisions. Scores are not averaged or calibrated."
-            )
 
-        st.markdown("<div style='font-size:0.83rem; font-weight:600; color:#E2E8F0; margin:10px 0 6px 0;'>Full-video audio analysis:</div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-size:0.85rem; font-weight:700; color:#E2E8F0; margin:12px 0 6px 0;'>3. Multi-Modal Audio & Speech Modules</div>", unsafe_allow_html=True)
         c_v1, c_v2, c_v3 = st.columns(3)
-        enable_verbal = c_v1.checkbox("Transcribe speech and flag verbal candidates", value=True, help="Runs local multilingual Whisper ASR across the full audio track. English lexicon matches and multilingual toxicity candidates are shown separately.", key=f"verbal_{preset}")
-        enable_toxicity = c_v2.checkbox("Multilingual toxicity scoring", value=True, help="Optional broad toxicity signal for English, French, Spanish, Italian, Portuguese, Turkish, and Russian. It is not a threat classifier.", key=f"toxicity_{preset}")
-        enable_audio = c_v3.checkbox("Detect sound-event candidates", value=True, help="Runs AudioSet AST on overlapping 10-second audio windows. First use may load/download model weights; CPU progress is shown per window.", key=f"audio_{preset}")
-        st.info("Two steps: this scan finds and saves all visual, speech, and sound candidates first. After reviewing the event list, run Qwen explanations from the Report tab.")
-        flag_standalone = st.checkbox("Create standalone speech events when no visual event overlaps", value=True, key=f"stand_{preset}")
+        enable_verbal = c_v1.checkbox("Whisper ASR Speech Transcription", value=defaults.enable_verbal_abuse_detection, help="Runs local multilingual Whisper ASR across audio track.", key="enable_verbal_analysis")
+        enable_toxicity = c_v2.checkbox("Multilingual Toxicity Scoring", value=defaults.enable_multilingual_toxicity, help="Scores speech for toxicity across English, Spanish, French, etc.", key="enable_toxicity_analysis")
+        enable_audio = c_v3.checkbox("AudioSet Sound-Event Detection", value=defaults.enable_audio_event_detection, help="Detects sound candidates using AudioSet AST on 10s audio windows.", key="enable_audio_analysis")
+        flag_standalone = st.checkbox("Create standalone speech events when no visual event overlaps", value=defaults.flag_standalone_verbal_abuse, key="standalone_speech_events")
 
     cfg = AnalysisConfig(
-        key, float(win), float(stride), float(thr), float(gap), float(min_ev), int(n_ev),
+        key, float(win), float(stride), float(thr_def), float(gap), float(min_ev), int(n_ev),
         enable_temporal_refinement=bool(enable_ref),
         suppress_shot_cuts=bool(suppress_cuts),
         filter_isolated_spikes=bool(filter_spikes),
@@ -375,8 +419,6 @@ def render(repo: Repository) -> None:
         enable_audio_event_detection=bool(enable_audio),
         enable_qwen_explanations=False,
         use_temporal_transformer=bool(use_temporal),
-        enable_videomae_comparison=bool(enable_videomae),
-        videomae_threshold=float(videomae_threshold),
     )
     try:
         cfg.validate()
@@ -391,24 +433,24 @@ def render(repo: Repository) -> None:
     if existing:
         st.markdown(
             f"<div style='background:rgba(59, 130, 246, 0.08); border:1px solid rgba(59, 130, 246, 0.25); "
-            f"border-radius:6px; padding:10px 14px; margin:1rem 0; font-size:0.88rem; color:#93C5FD;'>"
-            f"<b>Existing Analysis Found:</b> This video has already been analyzed with identical settings (Run #{existing['id']})."
+            f"border-radius:8px; padding:12px 16px; margin:1.25rem 0; font-size:0.88rem; color:#93C5FD; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;'>"
+            f"<div><b>Existing Analysis Available:</b> This video has already been analyzed with identical settings (Run #{existing['id']}).</div>"
             f"</div>",
             unsafe_allow_html=True
         )
-        c_ex1, c_ex2, c_ex3 = st.columns([1.5, 1.5, 1])
+        c_ex1, c_ex2, c_ex3 = st.columns([2, 2, 1.2])
         with c_ex1:
-            st.button("Open Existing Report", type="primary", use_container_width=True,
+            st.button("Open Existing Report →", type="primary", use_container_width=True,
                       on_click=goto, args=("Report",), kwargs={"selected_run_id": existing["id"]})
         with c_ex2:
-            rerun = st.checkbox("Re-analyze Video (Generates new Run)")
+            rerun = st.checkbox("Re-analyze Video (Creates new Run)")
         with c_ex3:
             if st.button("🗑️ Delete Old Run", key=f"del_exist_{existing['id']}", use_container_width=True):
                 repo.delete_run(existing["id"])
-                st.success(f"Run #{existing['id']} deleted. You can now analyze again.")
+                st.success(f"Run #{existing['id']} deleted.")
                 st.rerun()
 
-    if not st.button("▶ Start Violence Detection", type="primary",
+    if not st.button("▶ Run Multi-Modal Analysis", type="primary",
                      disabled=bool(existing) and not rerun, use_container_width=True):
         return
 
@@ -425,8 +467,14 @@ def render(repo: Repository) -> None:
         st.error("Insufficient memory for neural inference.")
         return
 
-    st.markdown("<div style='height: 1.25rem;'></div>", unsafe_allow_html=True)
-    st.markdown("<h4 style='color:#F8FAFC; font-size:1rem; font-weight:600;'>Analysis Progress</h4>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 1.5rem;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;'>"
+        "<h4 style='color:#F8FAFC; font-size:1.05rem; font-weight:700; margin:0;'>Analysis Execution</h4>"
+        "<span style='font-size:0.75rem; color:#10B981; font-weight:600;'>● Processing Active</span>"
+        "</div>",
+        unsafe_allow_html=True
+    )
 
     bar = st.progress(0.0)
     stage_box = st.empty()
@@ -436,15 +484,16 @@ def render(repo: Repository) -> None:
         bar.progress(min(max(frac, 0.0), 1.0))
         elapsed = time.perf_counter() - t0
         stage_box.markdown(
-            f"<div style='background:#111827; border-left:3px solid #3B82F6; border-radius:4px; "
-            f"padding:8px 12px; margin-top:6px; font-size:0.85rem; color:#E2E8F0;'>"
-            f"<span style='color:#60A5FA; font-weight:600;'>{stage.upper()}</span>: {msg} "
-            f"<span style='float:right; color:#64748B;'>{elapsed:.1f}s</span></div>",
+            f"<div style='background:rgba(17, 24, 39, 0.8); border:1px solid rgba(255,255,255,0.08); "
+            f"border-left:3px solid #3B82F6; border-radius:6px; padding:10px 14px; margin-top:8px; font-size:0.86rem; color:#E2E8F0;'>"
+            f"<span style='color:#60A5FA; font-weight:700; text-transform:uppercase;'>STAGE: {stage}</span> &nbsp;|&nbsp; {msg} "
+            f"<span style='float:right; color:#94A3B8; font-weight:600;'>{elapsed:.1f}s</span></div>",
             unsafe_allow_html=True
         )
 
     try:
-        run_id = run_analysis(vid, str(source_path), meta, cfg, clf, repo, progress)
+        run_id = run_analysis(vid, str(source_path), meta, cfg, clf, repo, progress,
+                              stop_after_visual=True)
     except AnalysisCancelled:
         st.warning("Analysis cancelled; partial data saved.")
         return
@@ -453,18 +502,17 @@ def render(repo: Repository) -> None:
         return
 
     run = repo.get_run(run_id)
-    if run["status"] == "completed":
-        st.markdown(
-            f"<div style='background:rgba(16, 185, 129, 0.08); border:1px solid rgba(16, 185, 129, 0.3); "
-            f"border-radius:6px; padding:14px; margin:1.25rem 0; text-align:center;'>"
-            f"<div style='color:#10B981; font-weight:600; font-size:0.95rem;'>Analysis Complete</div>"
-            f"<div style='color:#94A3B8; font-size:0.85rem; margin-top:2px;'>"
-            f"Analyzed {n_windows} temporal clips in {run['elapsed_s']:.1f}s ({run['elapsed_s'] / meta.duration_s:.2f}× real-time speed)."
-            f"</div></div>",
-            unsafe_allow_html=True
-        )
-    else:
-        st.warning(f"Analysis finished with status: {run['status']}")
-
-    st.button("📋 View Incident Report", type="primary",
-              on_click=goto, args=("Report",), kwargs={"selected_run_id": run_id}, use_container_width=True)
+    info = json.loads(run["model_info_json"] or "{}")
+    info["content_title_context"] = title_context
+    stages = info.setdefault("analysis_stages", {})
+    stages.setdefault("visual", {"status": "completed", "windows": n_windows})
+    stages.setdefault("audio", {"status": "pending" if cfg.enable_audio_event_detection else "completed"})
+    stages.setdefault("speech", {"status": "pending" if cfg.enable_verbal_abuse_detection else "completed"})
+    repo.update_run_model_info(run_id, info)
+    st.session_state[f"progressive_analysis_{run_id}"] = {
+        "run_id": run_id, "video_id": vid, "visual": stages["visual"],
+        "audio": stages["audio"], "speech": stages["speech"], "results": {},
+    }
+    st.session_state["progressive_active_run_id"] = run_id
+    goto("Report", selected_run_id=run_id)
+    st.rerun()

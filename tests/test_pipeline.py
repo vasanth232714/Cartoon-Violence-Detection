@@ -78,31 +78,21 @@ class TestPipeline(unittest.TestCase):
         self.assertIn("cartoon character falls", events[0]["qwen_explanation"])
         explain.assert_called_once()
 
-    def test_optional_videomae_scores_are_saved_separately_from_x3d(self):
-        from unittest.mock import patch
-        v = make_video(os.path.join(self.tmp.name, "videomae.mp4"))
-        cfg = AnalysisConfig(enable_videomae_comparison=True,
-                             enable_verbal_abuse_detection=False,
-                             enable_audio_event_detection=False,
-                             use_temporal_transformer=False)
-        def fake_compare(video_path, meta, windows, progress=None):
-            if progress:
-                progress(1.0, "done")
-            return ([{"window_index": i, "start_s": start, "end_s": end,
-                      "p_violent": 0.8, "status": "ok", "inference_ms": 1.0, "note": ""}
-                     for i, (start, end) in enumerate(windows)],
-                    {"status": "completed", "model_id": "HappyGook/videomae-violence-detector",
-                     "num_frames": 16, "input_size": 224, "device": "cpu"})
-        with patch("models.videomae_detector.run_videomae_comparison", side_effect=fake_compare):
-            run_id, _ = self._run(v, FakeBrightnessClassifier(), config=cfg)
-        x3d = self.repo.list_windows(run_id)
-        videomae = self.repo.list_model_window_scores(run_id, "videomae")
-        self.assertEqual(len(videomae), len(x3d))
-        self.assertTrue(all(row["p_violent"] == 0.8 for row in videomae))
-        self.assertTrue(all(row["p_violent"] != 0.8 for row in x3d))
+    def test_progressive_run_stops_after_visual_and_persists_pending_stages(self):
         import json
-        info = json.loads(self.repo.get_run(run_id)["model_info_json"])
-        self.assertEqual(info["videomae_comparison"]["status"], "completed")
+        v = make_video(os.path.join(self.tmp.name, "progressive.mp4"))
+        cfg = AnalysisConfig(enable_verbal_abuse_detection=True,
+                             enable_audio_event_detection=True,
+                             use_temporal_transformer=False)
+        run_id, _ = self._run(v, FakeBrightnessClassifier(), config=cfg, stop_after_visual=True)
+        run = self.repo.get_run(run_id)
+        info = json.loads(run["model_info_json"])
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(info["analysis_stages"]["visual"]["status"], "completed")
+        self.assertEqual(info["analysis_stages"]["audio"]["status"], "pending")
+        self.assertEqual(info["analysis_stages"]["speech"]["status"], "pending")
+        self.assertGreater(len(self.repo.list_windows(run_id)), 0)
+        self.assertEqual(self.repo.list_audio_segments(run_id), [])
 
     def test_explicit_threat_severity_and_explanation_stay_consistent(self):
         from unittest.mock import patch

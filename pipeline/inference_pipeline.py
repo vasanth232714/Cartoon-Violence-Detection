@@ -74,7 +74,8 @@ def _qwen_explain_interval(video_path: str, start_s: float, end_s: float, event_
 
 def run_analysis(video_id: int, video_path: str, meta: VideoMetadata, cfg: AnalysisConfig,
                  classifier: ClipClassifier, repo: Repository, progress: ProgressCB | None = None,
-                 should_cancel: Callable[[], bool] | None = None, evidence_root: Path | None = None) -> int:
+                 should_cancel: Callable[[], bool] | None = None, evidence_root: Path | None = None,
+                 stop_after_visual: bool = False) -> int:
     cfg.validate()
     spec = MODEL_REGISTRY[cfg.model_key]
     progress = progress or (lambda stage, frac, msg: None)
@@ -82,6 +83,14 @@ def run_analysis(video_id: int, video_path: str, meta: VideoMetadata, cfg: Analy
     if hasattr(classifier, "configure"):
         classifier.configure(use_adapter=cfg.use_adapter, use_tta=cfg.use_tta)
     run_id = repo.create_run(video_id, cfg.model_key, classifier.info, cfg.to_json(), cfg.config_hash(), APP_VERSION)
+    run_model_info = dict(classifier.info)
+    if stop_after_visual:
+        run_model_info["analysis_stages"] = {
+            "visual": {"status": "running"},
+            "audio": {"status": "pending" if cfg.enable_audio_event_detection else "completed"},
+            "speech": {"status": "pending" if cfg.enable_verbal_abuse_detection else "completed"},
+        }
+        repo.update_run_model_info(run_id, run_model_info)
     t0 = time.perf_counter()
     preds: list[WindowPrediction] = []
     window_features: list = []
@@ -95,7 +104,6 @@ def run_analysis(video_id: int, video_path: str, meta: VideoMetadata, cfg: Analy
             raise ValueError("No analysis windows could be built for this video.")
 
         t_inf = 0.0
-        run_model_info = dict(classifier.info)
         temporal_model = None
         temporal_metadata: dict = {}
         if cfg.use_temporal_transformer and TEMPORAL_MODEL_PATH.is_file():
@@ -181,38 +189,6 @@ def run_analysis(video_id: int, video_path: str, meta: VideoMetadata, cfg: Analy
 
         repo.update_run_model_info(run_id, run_model_info)
 
-        # Optional independent VideoMAE comparison. The checkpoint's own processor is used and its
-        # probabilities are never fused with X3D or used to alter the baseline event list.
-        if getattr(cfg, "enable_videomae_comparison", False):
-            try:
-                progress("VideoMAE comparison", 0.84, "Loading optional pretrained model on CPU")
-                from models.videomae_detector import run_videomae_comparison
-                videomae_rows, videomae_metadata = run_videomae_comparison(
-                    video_path, meta, windows,
-                    progress=lambda fraction, message: progress(
-                        "VideoMAE comparison", 0.84 + 0.01 * min(max(float(fraction), 0.0), 1.0), message
-                    ),
-                )
-                repo.add_model_window_scores(run_id, "videomae", videomae_rows)
-                videomae_metadata["candidate_threshold"] = float(getattr(cfg, "videomae_threshold", 0.50))
-                run_model_info["videomae_comparison"] = videomae_metadata
-                if videomae_metadata.get("status") != "completed":
-                    warnings.append(
-                        f"VideoMAE comparison completed with errors in some windows "
-                        f"({videomae_metadata.get('windows_completed', 0)}/{len(windows)} scored)."
-                    )
-            except Exception as exc:
-                logger.warning("VideoMAE comparison unavailable: %s", exc)
-                videomae_metadata = {
-                    "status": "failed", "model_id": "HappyGook/videomae-violence-detector",
-                    "model_card_url": "https://huggingface.co/HappyGook/videomae-violence-detector",
-                    "error": f"{type(exc).__name__}: {exc}", "scores_are_calibrated": False,
-                    "cartoon_accuracy_claimed": False,
-                }
-                run_model_info["videomae_comparison"] = videomae_metadata
-                warnings.append(f"Optional VideoMAE comparison failed: {type(exc).__name__}: {exc}")
-            repo.update_run_model_info(run_id, run_model_info)
-
         # Post-processing: same code path as training/fit.py, so tuned settings behave identically here.
         post = cfg.post_params()
         progress("Precision calibration", 0.85, "Temporal smoothing, shot-cut discount, hysteresis")
@@ -234,7 +210,7 @@ def run_analysis(video_id: int, video_path: str, meta: VideoMetadata, cfg: Analy
         out_root = (evidence_root or EVIDENCE_DIR) / f"run_{run_id}"
 
         # Verbal Abuse & Dialogue Profanity Analysis
-        enable_verbal = getattr(cfg, "enable_verbal_abuse_detection", True)
+        enable_verbal = getattr(cfg, "enable_verbal_abuse_detection", True) and not stop_after_visual
         flag_standalone = getattr(cfg, "flag_standalone_verbal_abuse", True)
         event_abuse_map: dict[int, list] = {}
         standalone_spans: list = []
@@ -287,7 +263,7 @@ def run_analysis(video_id: int, video_path: str, meta: VideoMetadata, cfg: Analy
         audio_event_map: dict[int, list[dict]] = {ev.event_no: [] for ev in events}
         standalone_audio: list[dict] = []
         audio_metadata: dict = {"status": "disabled"}
-        if cfg.enable_audio_event_detection:
+        if cfg.enable_audio_event_detection and not stop_after_visual:
             try:
                 progress("Audio-event analysis", 0.91, "Scanning audio independently for sound-event candidates")
                 from models.audio_event_detector import detect_audio_events
@@ -421,6 +397,33 @@ def run_analysis(video_id: int, video_path: str, meta: VideoMetadata, cfg: Analy
                 "qwen_explanation": qwen_exp, "qwen_status": qwen_status,
             }, [{"path": f.path, "timestamp_s": f.timestamp_s, "kind": f.kind} for f in frames])
 
+        if stop_after_visual:
+            # Persist a complete visual result before the separately resumable audio and speech stages.
+            run_model_info["speech_analysis"] = {
+                "status": "pending" if cfg.enable_verbal_abuse_detection else "completed",
+                "enabled": bool(cfg.enable_verbal_abuse_detection),
+            }
+            run_model_info["audio_event_analysis"] = {
+                "status": "pending" if cfg.enable_audio_event_detection else "completed",
+                "enabled": bool(cfg.enable_audio_event_detection),
+            }
+            run_model_info["analysis_stages"] = {
+                "visual": {"status": "completed", "events": len(events), "windows": len(windows)},
+                "audio": {"status": "pending" if cfg.enable_audio_event_detection else "completed"},
+                "speech": {"status": "pending" if cfg.enable_verbal_abuse_detection else "completed"},
+            }
+            run_model_info["qwen_explanations"] = {
+                "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+                "status": "deferred; run from the report after candidate scan",
+                "generated_events": 0, "selected_events": 0,
+            }
+            repo.update_run_model_info(run_id, run_model_info)
+            elapsed = time.perf_counter() - t0
+            status = "completed" if not warnings else "completed_with_warnings"
+            repo.finish_run(run_id, status, elapsed, timing, len(windows), len(preds) - n_err - n_skip, warnings)
+            progress("Visual results ready", 1.0, f"Both visual stages finished; {len(events)} X3D candidate event(s)")
+            return run_id
+
         # Standalone Verbal Abuse Incidents (Auditory harassment without physical motion)
         total_event_count = len(events)
         attached_audio_ids: set[int] = set()
@@ -528,11 +531,21 @@ def run_analysis(video_id: int, video_path: str, meta: VideoMetadata, cfg: Analy
         return run_id
     except AnalysisCancelled as e:
         _record_partial(repo, run_id, preds, windows)
+        if stop_after_visual:
+            run_model_info.setdefault("analysis_stages", {})["visual"] = {
+                "status": "failed", "error": str(e),
+            }
+            repo.update_run_model_info(run_id, run_model_info)
         repo.finish_run(run_id, "interrupted", time.perf_counter() - t0, timing, len(windows), len(preds),
                         warnings, str(e))
         raise
     except Exception as e:
         _record_partial(repo, run_id, preds, windows)
+        if stop_after_visual:
+            run_model_info.setdefault("analysis_stages", {})["visual"] = {
+                "status": "failed", "error": f"{type(e).__name__}: {e}",
+            }
+            repo.update_run_model_info(run_id, run_model_info)
         repo.finish_run(run_id, "failed", time.perf_counter() - t0, timing, len(windows), len(preds),
                         warnings, f"{type(e).__name__}: {e}")
         raise AnalysisFailed(run_id, f"{type(e).__name__}: {e}") from e

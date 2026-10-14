@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -29,6 +30,12 @@ class TestDB(unittest.TestCase):
         self.assertEqual(self.repo.get_video_by_hash("abc")["id"], self.vid)
         with self.assertRaises(Exception):
             self.repo.add_video("abc", "b.mp4", "/x/b.mp4", META)
+
+    def test_youtube_title_context_persists_separately_from_filename(self):
+        self.repo.set_video_title_context(self.vid, "Johnny Johnny Yes Papa", "youtube")
+        video = self.repo.get_video(self.vid)
+        self.assertEqual(video["video_title"], "Johnny Johnny Yes Papa")
+        self.assertEqual(video["title_source"], "youtube")
 
     def test_events_and_reviews_persist_after_reopen(self):
         eid = self.repo.add_event(self.run, EV, [{"path": "p.jpg", "timestamp_s": 3.0, "kind": "sampled"}])
@@ -67,17 +74,20 @@ class TestDB(unittest.TestCase):
         self.repo.delete_run(self.run)
         self.assertEqual(self.repo.list_audio_segments(self.run), [])
 
-    def test_optional_model_window_scores_are_separate_and_cascade_with_run(self):
-        self.repo.add_model_window_scores(self.run, "videomae", [{
-            "window_index": 0, "start_s": 0.0, "end_s": 4.0, "p_violent": 0.72,
-            "status": "ok", "inference_ms": 55.0,
+    def test_saved_transcript_details_can_be_updated_with_unicode(self):
+        self.repo.add_audio_segments(self.run, [{
+            "kind": "transcript", "start_s": 1.0, "end_s": 2.5,
+            "language": "ta", "text": "தமிழ் உரை", "source": "faster_whisper",
+            "details": {"toxicity_status": "not_scored"},
         }])
-        rows = self.repo.list_model_window_scores(self.run, "videomae")
-        self.assertEqual(len(rows), 1)
-        self.assertAlmostEqual(rows[0]["p_violent"], 0.72)
-        self.assertEqual(rows[0]["start_s"], 0.0)
-        self.repo.delete_run(self.run)
-        self.assertEqual(self.repo.list_model_window_scores(self.run, "videomae"), [])
+        segment = self.repo.list_audio_segments(self.run)[0]
+        updated = {"toxicity_score": 0.91, "toxicity_model": "tamil-abuse-model",
+                   "toxicity_status": "scored", "transcript": "தமிழ் உரை"}
+
+        self.repo.update_audio_segment_details(segment["id"], updated)
+
+        saved = self.repo.list_audio_segments(self.run)[0]
+        self.assertEqual(json.loads(saved["details_json"]), updated)
 
     def test_stale_running_marked_interrupted(self):
         self.assertEqual(self.repo.mark_stale_running(), 1)
